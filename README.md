@@ -329,7 +329,3 @@ sha256sum priority_data.csv      # compare with the sha256 field of DS-04 in dat
 - [ ] Add the manifest dictionary to the manifest and its generator
 
 ---
-
-## 9. Ownership
-
-Data collection and preparation, including the shared inventory, scenario files and this dataset branch, are maintained by **Kiran**. Dataset consumers are listed per file in the table in section 2 and in the `used_by` field of the manifest.
