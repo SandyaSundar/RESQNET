@@ -37,6 +37,7 @@ The platform has a React frontend, a FastAPI + PostgreSQL backend that owns the 
 | [`data_manifest.csv`](data_manifest.csv) | Docs | Source, licence, version, labels, provenance, split and quality record for every dataset | Whole team |
 | [`data_manifest_dictionary.csv`](data_manifest_dictionary.csv) | Docs | Describes each of the 27 columns of the manifest | Whole team |
 | [`generate_priority_data.py`](generate_priority_data.py) | Tooling | Reproducible generator for the priority data, its dictionary and the manifest | Data and priority teams |
+| `cv_dataset/` | *Planned* | Licensed, labelled person-detection images (not yet collected) | Computer vision |
 
 ```mermaid
 flowchart LR
@@ -232,3 +233,99 @@ Adding `zone_id` and `scenario_id` to the model did not change the result (0.789
 **Significance.** It makes the dataset reproducible rather than a one-off artefact. If a scenario, drone or fault parameter changes, the data can be rebuilt in seconds. It also asserts data quality on every run: no missing values, exactly 16 zones per snapshot, coverage in range, one split per episode, and consistency between the grid and each zone's cell counts.
 
 **Modelling assumption to be aware of.** With the configured speeds and a 3 × 3 sensor, six drones would cover the whole grid in about 150 s, before most failures begin. The replay therefore scans at 8.5 % of transit speed inside a target zone (`SWEEP_FACTOR` in the script). The JSON files are not modified. If the backend uses a different search rate, change this constant and regenerate.
+
+---
+
+### 4.8 `cv_dataset/` (planned)
+
+Image data for the person-detection module is **not yet collected**. Candidate sources to evaluate are VisDrone (aerial), COCO (person subset) and Open Images. Their licences must be confirmed per dataset and per image before use, and each source, version, licence, resolution and annotation format must be recorded in the manifest.
+
+The agreed detection output format is already used by `candidate_detections` in the scenario file:
+
+```json
+{
+  "image_id": "simulated-image-001",
+  "detections": [
+    { "label": "person", "confidence": 0.72, "bbox": [280, 181, 397, 284] }
+  ]
+}
+```
+
+General person detection does not prove survivor detection in rubble, floodwater or smoke. Detections are always **unconfirmed observations**, never completed rescues.
+
+---
+
+## 5. Quick start
+
+```bash
+git clone https://github.com/SandyaSundar/RESQNET.git
+cd RESQNET
+git switch dataset-scenarios
+python -m venv .venv && source .venv/bin/activate    # Windows: .\.venv\Scripts\Activate.ps1
+pip install numpy pandas
+```
+
+Load the priority data:
+
+```python
+import pandas as pd
+
+df = pd.read_csv("priority_data.csv")
+dd = pd.read_csv("priority_data_dictionary.csv")
+
+features = dd.loc[dd["kind"] == "feature", "column"].tolist()
+train, val, test = (df[df["split"] == s] for s in ("train", "validation", "test"))
+```
+
+Rebuild everything from the scenario files:
+
+```bash
+python generate_priority_data.py --inputs . --out .
+```
+
+Runtime is roughly 20 seconds. `priority_data.csv` is byte-identical on every run. The manifest `created` date follows `--date` (default: today), so pass `--date YYYY-MM-DD` for an identical manifest.
+
+Verify a file against its recorded checksum:
+
+```bash
+sha256sum priority_data.csv      # compare with the sha256 field of DS-04 in data_manifest.csv
+```
+
+---
+
+## 6. Known limitations
+
+- **All values are synthetic initial test parameters.** Nothing here is a validated real-world specification.
+- **`priority_target` is not a survivor probability.** It comes from documented rules plus a hidden factor and noise. A model trained on it learns the generator, so describe results as a *simulation experiment*.
+- **Only three maps with 16 zones each.** Zone-level memorisation is possible if identifiers are used as features. For a harder test, hold out an entire `scenario_id`.
+- **The three seeds share the same maps.** The default split tests generalisation across noise, not across maps.
+- **Strategy differences inside `priority_data.csv` come from a simplified replay.** They must not be quoted as RESQNET results. Use the backend simulation engine for the real three-way comparison.
+- **No detection is ever verified in the replay.** `detection_count` means unverified candidates only.
+- **The manifest dictionary is maintained by hand.** `generate_priority_data.py` does not regenerate `data_manifest_dictionary.csv`, and the manifest does not yet list it as an entry.
+- **Computer-vision data does not exist yet** (see 4.8).
+
+---
+
+## 7. Contributing
+
+1. Work on your own branch. Never commit directly to `main`.
+2. Open a Pull Request into `main`. The maintainer reviews and merges.
+3. Merge `origin/main` into your branch before opening a PR, and resolve conflicts locally.
+4. **Contract changes need agreement.** Changing a field name, ID format, status value or coordinate convention affects every component. Bump the version and notify the team.
+5. After changing any JSON file, re-run `generate_priority_data.py` and commit the regenerated outputs together with the change.
+6. Update `data_manifest.csv` whenever a dataset is added, replaced or its licence status changes.
+7. Never commit `.env` files, passwords, credentials, API keys or private datasets.
+
+---
+
+## 8. Roadmap
+
+- [x] Three disaster scenarios, drone configuration and failure scenarios
+- [x] Zone-priority dataset, dictionary and manifest
+- [x] Reproducible generator with built-in quality checks
+- [ ] Collect, license-check and document the computer-vision image set
+- [ ] Freeze scenarios and verify source and licence documentation before the final test matrix
+- [ ] Replace replay-based priority data with data exported from the backend simulation engine
+- [ ] Add the manifest dictionary to the manifest and its generator
+
+---
