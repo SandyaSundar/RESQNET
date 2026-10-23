@@ -16,6 +16,25 @@ def test_list_scenarios_returns_real_dataset() -> None:
     }
 
 
+def test_frontend_dataset_endpoints_and_production_cors() -> None:
+    dataset = client.get("/api/datasets/drone-config")
+    assert dataset.status_code == 200
+    assert isinstance(dataset.json()["fleets"], list)
+
+    preflight = client.options(
+        "/api/health",
+        headers={
+            "Origin": "https://resqnet-eight-psi.vercel.app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == (
+        "https://resqnet-eight-psi.vercel.app"
+    )
+
+
 def test_create_advance_and_retrieve_run() -> None:
     created = client.post(
         "/api/simulations",

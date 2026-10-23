@@ -5,6 +5,8 @@ from app.models import Base
 
 
 def initialize_tables() -> None:
+    if engine is None:
+        raise SystemExit("DATABASE_URL is not configured.")
     try:
         Base.metadata.create_all(bind=engine)
     except SQLAlchemyError:

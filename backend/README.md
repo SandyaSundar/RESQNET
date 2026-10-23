@@ -114,6 +114,19 @@ python -m pytest
 The health endpoint tests mock the database connectivity check. Model tests
 inspect SQLAlchemy metadata; neither is a PostgreSQL integration test.
 
+## Railway demo deployment
+
+Create a Railway service from the `backend` branch with the repository root as
+the service root so the scenario JSON files remain available. Set the build
+command to `pip install -r backend/requirements.txt` and the start command to
+`cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Set
+`RESQNET_DEMO_MODE=true` and `CORS_ORIGINS=https://resqnet-eight-psi.vercel.app`
+in the service variables. Add `DATABASE_URL` only when a real database is
+configured; demo mode provides a local SQLite health-check database otherwise.
+A configured `DATABASE_URL` takes precedence and preserves normal database
+behavior. Simulation runs remain in process memory and can be lost when the
+service restarts or is redeployed.
+
 ## Troubleshooting
 
 - Confirm the `postgresql-x64-18` Windows service is running.

@@ -1,7 +1,26 @@
 from fastapi.testclient import TestClient
 
 from app.api.routes import health
+from app.core.config import Settings
 from app.main import app
+
+
+def test_demo_mode_uses_sqlite_only_when_database_url_is_missing() -> None:
+    demo_settings = Settings(
+        _env_file=None,
+        database_url=None,
+        resqnet_demo_mode=True,
+    )
+    assert demo_settings.effective_database_url == "sqlite+pysqlite:///./resqnet-demo.sqlite3"
+
+    configured_settings = Settings(
+        _env_file=None,
+        database_url="postgresql+psycopg://db.example/resqnet",
+        resqnet_demo_mode=True,
+    )
+    assert configured_settings.effective_database_url == (
+        "postgresql+psycopg://db.example/resqnet"
+    )
 
 
 def test_health_returns_ok_when_database_is_available(monkeypatch) -> None:
