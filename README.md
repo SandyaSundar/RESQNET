@@ -1,9 +1,9 @@
-# RESQNET — Datasets and Scenario Suite
+# RESQNET — Integrated Simulation and Scenario Suite
 
-**Branch:** `dataset-scenarios` · **Contract version:** 1.0 · **Data files version:** 2.0
+**Contract version:** 1.0 · **Data files version:** 2.0
 
 > Simulation-based, resilient multi-agent drone coordination for disaster response.
-> All data in this branch is **synthetic**. Every value is an initial test parameter, not a claimed real-world operating specification.
+> All scenario and configuration data in this repository is **synthetic**. Every value is an initial test parameter, not a claimed real-world operating specification.
 
 ---
 
@@ -11,7 +11,7 @@
 
 RESQNET (Resilient Drone Coordination for Disaster Response) is a browser-based simulation that asks one question: **how should a small drone fleet coordinate a search when the network or the central controller fails?**
 
-A judge opens the web app, picks a disaster scenario (earthquake, cyclone or flood), and launches a mission with six simulated drones searching a 20 × 20 grid. They can then inject a controller outage or a network partition and watch the system react in real time. RESQNET compares three coordination strategies on identical conditions:
+The product goal is to compare how a small drone fleet coordinates search under network or controller failures. The current application launches deterministic missions on the scenario maps; failure injection and active coordination-strategy comparison are not implemented yet.
 
 | Strategy | Idea | Weak point it is tested against |
 |---|---|---|
@@ -19,38 +19,33 @@ A judge opens the web app, picks a disaster scenario (earthquake, cyclone or flo
 | **Decentralized** | Drones claim tasks locally | Duplicate or stale claims |
 | **Hybrid** | Central planning while connected, local claiming and reconciliation when not | Recovery and reconnection logic |
 
-The platform has a React frontend, a FastAPI + PostgreSQL backend that owns the simulation clock, an optional computer-vision module that returns *unconfirmed* person detections, and an optional ML module that ranks search zones.
+The integrated repository includes a React/Vite frontend and a FastAPI backend. The backend runs the deterministic, tick-based simulation and keeps simulation runs in memory. SQLAlchemy provides PostgreSQL health checks and initial scenario/run tables. The computer-vision and priority-model sections below retain the data contract and roadmap; those optional components are not included in the current application.
 
-**This branch is the data layer.** It holds the scenario definitions, drone and failure configurations, the zone-priority dataset, and the provenance records that every other component builds on.
+The root-level scenario JSON files and provenance manifests from the original destination `main` are retained alongside the application components.
 
 ---
 
-## 2. What is in this branch
+## 2. Integrated repository layout and retained data
 
-| File | Type | Role | Primary consumers |
-|---|---|---|---|
-| [`disaster_scenarios.json`](disaster_scenarios.json) | Contract | Three 20 × 20 maps: obstacles, restricted zones, 16 zones, tasks, candidate detections, comms conditions | Frontend, backend simulation, priority model |
-| [`drone_config.json`](drone_config.json) | Contract | Drone types, speeds, ranges, battery model, six-drone fleets per map | Backend simulation |
-| [`failure_scenarios.json`](failure_scenarios.json) | Contract | Eight fault schedules and a 24-run test matrix with recorded seeds | Backend simulation, testing |
-| [`priority_data.csv`](priority_data.csv) | Derived | 72,576 zone-ranking rows with features, a synthetic target and a rule baseline | Priority prediction |
-| [`priority_data_dictionary.csv`](priority_data_dictionary.csv) | Docs | Describes each of the 47 columns of `priority_data.csv` | Priority prediction |
-| [`data_manifest.csv`](data_manifest.csv) | Docs | Source, licence, version, labels, provenance, split and quality record for every dataset | Whole team |
-| [`data_manifest_dictionary.csv`](data_manifest_dictionary.csv) | Docs | Describes each of the 27 columns of the manifest | Whole team |
-| [`generate_priority_data.py`](generate_priority_data.py) | Tooling | Reproducible generator for the priority data, its dictionary and the manifest | Data and priority teams |
-| `cv_dataset/` | *Planned* | Licensed, labelled person-detection images (not yet collected) | Computer vision |
+| Path | Role |
+|---|---|
+| `backend/` | FastAPI API, simulation engine, SQLAlchemy database/models, dependencies, and tests |
+| `frontend/` | React/Vite application, production build configuration, and Vercel SPA rewrite |
+| `disaster_scenarios.json` | Three shared synthetic disaster maps and search scenarios |
+| `drone_config.json` | Synthetic drone types, fleets, movement and battery parameters |
+| `failure_scenarios.json` | Synthetic failure schedules and test matrix consumed by the simulation |
+| `data_manifest.csv`, `data_manifest_dictionary.csv` | Destination provenance records retained from the original `main` history |
+
+The priority-data CSVs, dictionary, and generator documented in sections 4.4, 4.5 and 4.7 are not present in the integrated tree; those sections preserve the original data-contract design only.
 
 ```mermaid
 flowchart LR
-  A[disaster_scenarios.json] --> S[Simulation engine]
+  A[disaster_scenarios.json] --> S[Backend simulation]
   B[drone_config.json] --> S
   C[failure_scenarios.json] --> S
-  A --> G[generate_priority_data.py]
-  B --> G
-  C --> G
-  G --> P[priority_data.csv]
-  G --> M[data_manifest.csv]
-  P --> ML[Priority model]
-  A --> UI[Frontend map]
+  S --> API[FastAPI /api endpoints]
+  API --> UI[React frontend]
+  M[data manifests] --> P[Provenance and limitations]
 ```
 
 ---
@@ -257,51 +252,36 @@ General person detection does not prove survivor detection in rubble, floodwater
 
 ## 5. Quick start
 
-```bash
-git clone https://github.com/SandyaSundar/RESQNET.git
-cd RESQNET
-git switch dataset-scenarios
-python -m venv .venv && source .venv/bin/activate    # Windows: .\.venv\Scripts\Activate.ps1
-pip install numpy pandas
+### Backend
+
+From `backend/`, create and activate a Python 3.12 virtual environment, install `requirements.txt`, and copy `.env.example` to `.env`. Set `DATABASE_URL` for PostgreSQL and keep `CORS_ORIGINS` limited to exact frontend origins.
+
+```powershell
+python -m app.database.init_db
+python -m uvicorn app.main:app --reload
 ```
 
-Load the priority data:
+The API listens at `http://127.0.0.1:8000`. The simulation API is under `/api/simulations`; datasets are available under `/api/datasets`.
 
-```python
-import pandas as pd
+### Frontend
 
-df = pd.read_csv("priority_data.csv")
-dd = pd.read_csv("priority_data_dictionary.csv")
+From `frontend/`, copy `.env.example` to `.env`, run `npm ci`, then `npm run dev`. Leave `VITE_BACKEND_URL` blank locally to use the Vite `/api` proxy to `http://127.0.0.1:8000`.
 
-features = dd.loc[dd["kind"] == "feature", "column"].tolist()
-train, val, test = (df[df["split"] == s] for s in ("train", "validation", "test"))
-```
+### Production
 
-Rebuild everything from the scenario files:
+Vercel Root Directory is `frontend`. Set the Production `VITE_BACKEND_URL` to the actual backend public origin without a trailing slash. That backend origin is not stored in the repository; obtain it from the hosting provider before deployment. The backend allowlist is configured with `CORS_ORIGINS`.
 
-```bash
-python generate_priority_data.py --inputs . --out .
-```
-
-Runtime is roughly 20 seconds. `priority_data.csv` is byte-identical on every run. The manifest `created` date follows `--date` (default: today), so pass `--date YYYY-MM-DD` for an identical manifest.
-
-Verify a file against its recorded checksum:
-
-```bash
-sha256sum priority_data.csv      # compare with the sha256 field of DS-04 in data_manifest.csv
-```
-
----
+The database initializer uses SQLAlchemy `create_all` and creates missing tables without altering existing tables. There are no versioned migrations. Simulation runs are currently in memory and are not persisted to PostgreSQL.
 
 ## 6. Known limitations
 
 - **All values are synthetic initial test parameters.** Nothing here is a validated real-world specification.
-- **`priority_target` is not a survivor probability.** It comes from documented rules plus a hidden factor and noise. A model trained on it learns the generator, so describe results as a *simulation experiment*.
+- **Priority-data files and generator described in sections 4.4, 4.5 and 4.7 are not present in the integrated tree.** Treat those sections as retained contract documentation, not as available runtime artifacts.
 - **Only three maps with 16 zones each.** Zone-level memorisation is possible if identifiers are used as features. For a harder test, hold out an entire `scenario_id`.
 - **The three seeds share the same maps.** The default split tests generalisation across noise, not across maps.
-- **Strategy differences inside `priority_data.csv` come from a simplified replay.** They must not be quoted as RESQNET results. Use the backend simulation engine for the real three-way comparison.
-- **No detection is ever verified in the replay.** `detection_count` means unverified candidates only.
-- **The manifest dictionary is maintained by hand.** `generate_priority_data.py` does not regenerate `data_manifest_dictionary.csv`, and the manifest does not yet list it as an entry.
+- The current API accepts no implemented failure-injection endpoint, and its coordination-mode request is not applied by the simulation engine. Do not describe the current UI as comparing active coordination strategies.
+- Candidate detections in scenario JSON are unverified simulation data. `ground_truth` is backend-only and must never be presented as confirmed detection.
+- The manifest dictionary is retained from the destination project. Update provenance records when the underlying data changes.
 - **Computer-vision data does not exist yet** (see 4.8).
 
 ---
@@ -312,7 +292,7 @@ sha256sum priority_data.csv      # compare with the sha256 field of DS-04 in dat
 2. Open a Pull Request into `main`. The maintainer reviews and merges.
 3. Merge `origin/main` into your branch before opening a PR, and resolve conflicts locally.
 4. **Contract changes need agreement.** Changing a field name, ID format, status value or coordinate convention affects every component. Bump the version and notify the team.
-5. After changing any JSON file, re-run `generate_priority_data.py` and commit the regenerated outputs together with the change.
+5. After changing a dataset, update the corresponding manifest record and run the backend/frontend checks that consume it.
 6. Update `data_manifest.csv` whenever a dataset is added, replaced or its licence status changes.
 7. Never commit `.env` files, passwords, credentials, API keys or private datasets.
 
@@ -321,11 +301,9 @@ sha256sum priority_data.csv      # compare with the sha256 field of DS-04 in dat
 ## 8. Roadmap
 
 - [x] Three disaster scenarios, drone configuration and failure scenarios
-- [x] Zone-priority dataset, dictionary and manifest
-- [x] Reproducible generator with built-in quality checks
+- [ ] Add the priority dataset, dictionary, and manifest entries described by the retained contract documentation
+- [ ] Add a reproducible priority-data generator and quality checks
 - [ ] Collect, license-check and document the computer-vision image set
 - [ ] Freeze scenarios and verify source and licence documentation before the final test matrix
-- [ ] Replace replay-based priority data with data exported from the backend simulation engine
-- [ ] Add the manifest dictionary to the manifest and its generator
 
 ---
