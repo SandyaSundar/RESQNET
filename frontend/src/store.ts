@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { api, type CoordinationMode } from './api'
+import { api, type CoordinationMode, type CustomFailureEvent, validateCustomFailurePlan } from './api'
 import { Obs, emptyObs, observe, rowsOf, summary, dname } from './lib'
 
 export type Sev = 'info' | 'warn' | 'error'
@@ -15,15 +15,17 @@ const mk = (tick: number, sev: Sev, cat: string, msg: string, drone?: string): E
 
 interface S {
   droneCfg: any | null; failScen: any[]; failId: string; setFailScenario: (id: string) => void
+  failureSource: 'none' | 'predefined' | 'custom'; setFailureSource: (source: 'none' | 'predefined' | 'custom') => void
+  customPlan: CustomFailureEvent[]; setCustomPlan: (events: CustomFailureEvent[]) => void
   scenarios: any[]; scenarioId: string; mode: CoordinationMode
   run: any | null; archived: boolean; trails: Record<string, [number, number][]>; visited: Set<string>; dist: Record<string, number>; bat: Record<string, number>; lastSeen: Record<string, number>
   events: Ev[]; alerts: Alert[]; handoffs: Handoff[]; active: Record<string, 1>; obs: Obs
   covHistory: { tick: number; cov: number; done: number; disc: number; dup: number }[]
-  running: boolean; busy: boolean; error: string; health: string
+  running: boolean; busy: boolean; error: string; health: string; booting: boolean
   speedMs: number; ticksPerStep: number; selected: string; seed: string; basemap: 'satellite' | 'dark'; secPerTick: number
   saved: any[]; comparison: any[]; cmpProgress: string
   boot: () => Promise<void>; setScenario: (id: string) => void; setMode: (m: CoordinationMode) => void
-  start: () => Promise<void>; step: () => Promise<void>; setRunning: (b: boolean) => void; reset: () => void
+  start: () => Promise<boolean>; step: () => Promise<void>; setRunning: (b: boolean) => void; reset: () => void
   setSpeed: (n: number) => void; setTicksPerStep: (n: number) => void; select: (id: string) => void
   setSeed: (s: string) => void; setBasemap: (b: 'satellite' | 'dark') => void; setSecPerTick: (n: number) => void
   saveRun: () => void; openSaved: (id: string) => Promise<boolean>; deleteSaved: (id: string) => void
@@ -32,6 +34,15 @@ interface S {
 }
 
 const fresh = () => ({ run: null, archived: false, trails: {}, visited: new Set<string>(), dist: {}, bat: {}, lastSeen: {}, events: [], alerts: [], handoffs: [], active: {}, obs: emptyObs(), covHistory: [] })
+const initialFailId = localStorage.getItem('rq_fail') || ''
+const storedFailureSource = localStorage.getItem('rq_schedule_source')
+const initialFailureSource: S['failureSource'] = storedFailureSource === 'none' || storedFailureSource === 'predefined' || storedFailureSource === 'custom'
+  ? storedFailureSource
+  : initialFailId ? 'predefined' : 'none'
+const loadedCustomPlan = load('rq_custom_plan', [])
+const scenarioDroneIds = (scenarioId: string, droneCfg: any) =>
+  (droneCfg?.fleets?.find((fleet: any) => fleet.scenario_id === scenarioId)?.drones || [])
+    .map((drone: any) => drone.id)
 
 // Compare previous and next backend state -> events, alerts, handoffs, conflicts (everything derived from real data)
 function absorb(s: S, next: any) {
@@ -104,13 +115,16 @@ function absorb(s: S, next: any) {
 }
 
 export const useStore = create<S>((set, get) => ({
-  droneCfg: null, failScen: [], failId: localStorage.getItem('rq_fail') || '',
+  droneCfg: null, failScen: [], failId: initialFailId,
+  failureSource: initialFailureSource,
+  customPlan: Array.isArray(loadedCustomPlan) ? loadedCustomPlan : [],
   scenarios: [], scenarioId: localStorage.getItem('rq_scn') || '', mode: (localStorage.getItem('rq_mode') as CoordinationMode) || 'hybrid',
-  ...fresh(), running: false, busy: false, error: '', health: 'unknown',
+  ...fresh(), running: false, busy: false, error: '', health: 'unknown', booting: false,
   speedMs: load('rq_speed', 700), ticksPerStep: load('rq_tps', 1), selected: '', seed: load('rq_seed', ''), basemap: load('rq_base', 'satellite'), secPerTick: load('rq_spt', 2),
   saved: load('rq_saved2', []), comparison: [], cmpProgress: '',
 
   boot: async () => {
+    set({ booting: true })
     // Independent loads (a slow/hanging health check must never block scenarios or datasets).
     const health = api.health().then((h) => set({ health: h.status === 'ok' ? 'ok' : h.api === 'ok' ? 'db-offline' : 'unhealthy' }))
       .catch(() => set({ health: 'timeout' }))
@@ -121,21 +135,34 @@ export const useStore = create<S>((set, get) => ({
     await Promise.allSettled([health, scn, cfg, fs])
     // Scenarios loaded but health failed/timed out => the API is up and only the database check is the problem.
     if (get().scenarios.length && !['ok', 'db-offline'].includes(get().health)) set({ health: 'db-offline' })
+    set({ booting: false })
   },
   setFailScenario: (id) => {
-    localStorage.setItem('rq_fail', id); set({ failId: id })
+    localStorage.setItem('rq_fail', id)
+    const source = id ? 'predefined' : 'none'
+    localStorage.setItem('rq_schedule_source', source)
+    set({ failId: id, failureSource: source })
   },
+  setFailureSource: (source) => { localStorage.setItem('rq_schedule_source', source); set({ failureSource: source }) },
+  setCustomPlan: (events) => { persist('rq_custom_plan', events); set({ customPlan: events }) },
   setScenario: (id) => { localStorage.setItem('rq_scn', id); set({ scenarioId: id }) },
   setMode: (m) => { localStorage.setItem('rq_mode', m); set({ mode: m }) },
   start: async () => {
-    const { scenarioId, mode, failId } = get(); if (!scenarioId) return
+    const { scenarioId, mode, failId, failureSource, customPlan, droneCfg } = get(); if (!scenarioId) return false
+    if (failureSource === 'predefined' && !failId) { set({ error: 'Choose a predefined failure schedule or select no failure schedule.' }); return false }
+    if (failureSource === 'custom') {
+      const errors = validateCustomFailurePlan(customPlan, scenarioDroneIds(scenarioId, droneCfg))
+      if (errors.length) { set({ error: errors.join(' ') }); return false }
+    }
     set({ busy: true, running: false })
     try {
       let r = await api.create(scenarioId, mode)
-      if (failId) r = await api.installFailureSchedule(r.run_id, failId)
+      if (failureSource === 'predefined' && failId) r = await api.installFailureSchedule(r.run_id, failId)
+      else if (failureSource === 'custom') r = await api.installCustomFailurePlan(r.run_id, customPlan)
       set({ ...fresh(), error: '', selected: '' })
       set((s) => ({ ...absorb(s, r), events: [mk(0, 'info', 'System', `Run ${r.run_id.slice(0, 8)} created (${scenarioId}, mode: ${mode})`)], busy: false, running: true }))
-    } catch (e: any) { set({ busy: false, error: e.message }) }
+      return true
+    } catch (e: any) { set({ busy: false, running: false, error: e.message }); return false }
   },
   step: async () => {
     const { run, busy, ticksPerStep, archived } = get(); if (!run || busy || archived) return
@@ -174,19 +201,27 @@ export const useStore = create<S>((set, get) => ({
   },
   deleteSaved: (id) => { const next = get().saved.filter((x: any) => x.run_id !== id); persist('rq_saved2', next); set({ saved: next }) },
   clearSaved: () => { localStorage.removeItem('rq_saved2'); set({ saved: [] }) },
-  wipeLocal: () => { ['rq_saved2', 'rq_plan', 'rq_fail', 'rq_anchor', 'rq_seed', 'rq_base', 'rq_spt', 'rq_speed', 'rq_tps'].forEach((k) => localStorage.removeItem(k)); location.reload() },
-  // Each mode run receives the same selected dataset schedule before its first tick.
+  wipeLocal: () => { ['rq_saved2', 'rq_plan', 'rq_fail', 'rq_schedule_source', 'rq_custom_plan', 'rq_anchor', 'rq_seed', 'rq_base', 'rq_spt', 'rq_speed', 'rq_tps'].forEach((k) => localStorage.removeItem(k)); location.reload() },
+  // Each compared run receives the same selected schedule before its first tick.
   compare: async (ticks) => {
-    const { scenarioId, failId } = get(); if (!scenarioId) return
+    const { scenarioId, failId, failureSource, customPlan, droneCfg } = get(); if (!scenarioId) return
+    if (failureSource === 'predefined' && !failId) { set({ error: 'Choose a predefined failure schedule or select no failure schedule.' }); return }
+    if (failureSource === 'custom') {
+      const errors = validateCustomFailurePlan(customPlan, scenarioDroneIds(scenarioId, droneCfg))
+      if (errors.length) { set({ error: errors.join(' ') }); return }
+    }
     set({ busy: true, comparison: [], error: '', cmpProgress: '' })
     try {
       const rows: any[] = []; const chunk = ticks > 300 ? 5 : 1
       for (const m of ['centralized', 'decentralized', 'hybrid'] as CoordinationMode[]) {
         let r = await api.create(scenarioId, m); const id = r.run_id
         let injection = 'no failure schedule'
-        if (failId) {
+        if (failureSource === 'predefined' && failId) {
           r = await api.installFailureSchedule(id, failId)
           injection = `${failId} schedule installed`
+        } else if (failureSource === 'custom') {
+          r = await api.installCustomFailurePlan(id, customPlan)
+          injection = `custom plan (${customPlan.length} events) installed`
         }
         let o = observe(emptyObs(), r); let finished: number | null = null
         while (r.tick < ticks) {

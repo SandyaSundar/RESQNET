@@ -56,6 +56,52 @@ Start-Process http://127.0.0.1:8000/docs
 The health endpoint returns HTTP 200 when `SELECT 1` succeeds and HTTP 503 with
 a generic database-disconnected status otherwise.
 
+## Google sign-in
+
+Google sign-in is optional. With `GOOGLE_CLIENT_ID` unset, the simulation UI
+continues in guest mode. To enable it, create a Google OAuth client of type
+**Web application** and add each frontend URL under **Authorized JavaScript
+origins** (for local development, `http://localhost:5173` and
+`http://127.0.0.1:5173`; for deployment, the exact HTTPS frontend origin).
+This Google Identity Services button returns an ID-token credential to the
+frontend callback, so no OAuth redirect URI is used.
+
+Set the following in `backend/.env` (copy the non-secret defaults from
+`.env.example`; never commit `.env`):
+
+- `GOOGLE_CLIENT_ID`: the web client ID. This public identifier is served to
+  the configured frontend; the backend uses the same value as the only
+  accepted token audience.
+- `CORS_ORIGINS`: comma-separated, exact frontend origins. Keep the deployed
+  origin and add local origins only for development.
+- `AUTH_COOKIE_SECURE=false` and `AUTH_COOKIE_SAMESITE=lax` for local HTTP.
+  For HTTPS deployments use `AUTH_COOKIE_SECURE=true` and
+  `AUTH_COOKIE_SAMESITE=none` when the frontend and API are on different sites.
+  The cross-site cookie requires `Secure`; browser third-party-cookie policies
+  may still block it, so a same-origin `/api` proxy is preferred for production.
+
+The API contract is `GET /api/auth/config`, `GET /api/auth/nonce`,
+`POST /api/auth/google` with `{"credential":"<Google ID token>"}`,
+`GET /api/auth/me`, and `POST /api/auth/logout`. The short-lived nonce is
+bound to an HTTP-only cookie and must match the signed ID token, preventing
+login CSRF and credential replay. A successful sign-in creates an eight-hour,
+HTTP-only session cookie. The session is held in process memory and is revoked
+on logout; restarting the backend clears all sessions. Google credentials are
+verified server-side with `google-auth`. The UI routes require a session only
+when authentication is configured. Health, dataset, and simulation routes
+remain public for the current demo. Requests that create or revoke sessions
+must come from a configured `CORS_ORIGINS` origin.
+
+With credentials configured, visit `/login`, sign in with a Google account,
+open the profile menu to confirm the verified identity, and select **Sign
+out**. Without `GOOGLE_CLIENT_ID`, `/login` explains that Google sign-in is
+disabled and the app remains in guest mode. Invalid credentials produce a
+generic sign-in error; missing server-side `google-auth` produces a service
+unavailable response rather than accepting the token.
+
+Backend auth tests mock Google's verifier and need no Google account. Run the
+full suite with `python -m pytest` from `backend`.
+
 ## Basic drone simulation
 
 The simulation API uses the root `disaster_scenarios.json`,

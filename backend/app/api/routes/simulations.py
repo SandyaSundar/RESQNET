@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import logging
 from threading import RLock
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.simulation.engine import (
     CoordinationMode,
@@ -14,6 +16,7 @@ from app.simulation.engine import (
 from app.simulation.loader import (
     DatasetError,
     FailureScenarioNotFound,
+    InvalidCustomFailurePlan,
     IncompatibleFailureScenario,
     ScenarioLoader,
 )
@@ -21,6 +24,7 @@ from app.simulation.loader import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 loader = ScenarioLoader()
+MAX_CUSTOM_FAILURE_BODY_BYTES = 65_536
 
 
 class CreateSimulationRequest(BaseModel):
@@ -35,7 +39,62 @@ class AdvanceTicksRequest(BaseModel):
 class InstallFailureScheduleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    failure_scenario_id: str = Field(min_length=1, max_length=100)
+    failure_scenario_id: str | None = Field(default=None, min_length=1, max_length=100)
+    custom_plan: CustomFailurePlan | None = None
+
+    @model_validator(mode="after")
+    def require_exactly_one_schedule(self):
+        if (self.failure_scenario_id is None) == (self.custom_plan is None):
+            raise ValueError("Provide exactly one of failure_scenario_id or custom_plan.")
+        return self
+
+
+class CustomReconnectionTicks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detect_timeout_ticks: int = Field(strict=True, ge=0, le=10_000)
+    reconnect_delay_ticks: int = Field(strict=True, ge=0, le=10_000)
+    resync_time_ticks: int = Field(strict=True, ge=0, le=10_000)
+
+
+class CustomPartitionGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str = Field(min_length=1, max_length=50)
+    drone_ids: list[str] = Field(min_length=1, max_length=100)
+    has_controller_link: bool
+
+
+class CustomFailureEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["controller_outage", "network_partition", "drone_unresponsive"]
+    start_tick: int = Field(strict=True, ge=1, le=100_000)
+    restore_tick: int | None = Field(default=None, strict=True, ge=1, le=100_000)
+    drone_id: str | None = Field(default=None, min_length=1, max_length=100)
+    groups: list[CustomPartitionGroup] | None = Field(default=None, min_length=2, max_length=20)
+    reconnection: CustomReconnectionTicks | None = None
+
+    @model_validator(mode="after")
+    def validate_type_fields(self):
+        if self.restore_tick is not None and self.restore_tick <= self.start_tick:
+            raise ValueError("restore_tick must be greater than start_tick.")
+        if self.type == "drone_unresponsive":
+            if not self.drone_id or self.groups is not None or self.reconnection is not None:
+                raise ValueError("drone_unresponsive requires only a drone_id target.")
+        elif self.type == "controller_outage":
+            if self.restore_tick is None or self.drone_id is not None or self.groups is not None or self.reconnection is None:
+                raise ValueError("controller_outage requires restore_tick and reconnection timing.")
+        elif self.type == "network_partition":
+            if self.restore_tick is None or self.drone_id is not None or self.groups is None or self.reconnection is None:
+                raise ValueError("network_partition requires restore_tick, groups, and reconnection timing.")
+        return self
+
+
+class CustomFailurePlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[CustomFailureEvent] = Field(min_length=1, max_length=10)
 
 
 class SimulationRuns:
@@ -64,6 +123,19 @@ class SimulationRuns:
                 engine.scenario.scenario_id,
             )
             return engine.install_failure_schedule(schedule)
+
+    def install_custom_failure_schedule(
+        self,
+        run_id: str,
+        custom_events: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            engine = self._get(run_id)
+            schedule = loader.load_custom_failure_schedule(
+                engine.scenario.scenario_id,
+                custom_events,
+            )
+            return engine.install_custom_failure_schedule(schedule)
 
     def state(self, run_id: str) -> dict[str, Any]:
         with self._lock:
@@ -145,12 +217,29 @@ def advance_simulation(
 
 
 @router.post("/{run_id}/failures")
-def install_failure_schedule(
+async def install_failure_schedule(
     run_id: str,
-    request: InstallFailureScheduleRequest,
+    request: Request,
+    payload: InstallFailureScheduleRequest,
 ) -> dict[str, Any]:
+    if len(await request.body()) > MAX_CUSTOM_FAILURE_BODY_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Failure schedule payload exceeds {MAX_CUSTOM_FAILURE_BODY_BYTES} bytes.",
+        )
+    if len(payload.model_dump_json().encode("utf-8")) > MAX_CUSTOM_FAILURE_BODY_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Failure schedule payload exceeds {MAX_CUSTOM_FAILURE_BODY_BYTES} bytes.",
+        )
     try:
-        return runs.install_failure_schedule(run_id, request.failure_scenario_id)
+        if payload.custom_plan is not None:
+            return runs.install_custom_failure_schedule(
+                run_id,
+                [event.model_dump() for event in payload.custom_plan.events],
+            )
+        assert payload.failure_scenario_id is not None
+        return runs.install_failure_schedule(run_id, payload.failure_scenario_id)
     except FailureScenarioNotFound:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -166,11 +255,21 @@ def install_failure_schedule(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         ) from None
+    except InvalidCustomFailurePlan as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from None
     except DatasetError:
         logger.exception("Failure scenario dataset validation failed.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failure scenario dataset is unavailable or invalid.",
+        ) from None
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
         ) from None
 
 

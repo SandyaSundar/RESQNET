@@ -24,6 +24,10 @@ class IncompatibleFailureScenario(ValueError):
     pass
 
 
+class InvalidCustomFailurePlan(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class TaskDefinition:
     task_id: str
@@ -76,6 +80,14 @@ class FailureScenarioDefinition:
     event_status_values: tuple[str, ...]
     events: tuple[dict[str, Any], ...]
     test_matrix_entry: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class CustomFailureScheduleDefinition:
+    scenario_id: str
+    tick_s: int
+    event_status_values: tuple[str, ...]
+    events: tuple[dict[str, Any], ...]
 
 
 class ScenarioLoader:
@@ -278,6 +290,180 @@ class ScenarioLoader:
             events=tuple(dict(event) for event in failure["events"]),
             test_matrix_entry=dict(matrix_entry),
         )
+
+    def load_custom_failure_schedule(
+        self,
+        scenario_id: str,
+        custom_events: list[dict[str, Any]],
+    ) -> CustomFailureScheduleDefinition:
+        """Validate user-authored tick events and normalize them to dataset event fields."""
+        scenarios = self.load_all()
+        scenario_by_id = {scenario.scenario_id: scenario for scenario in scenarios}
+        scenario = scenario_by_id.get(scenario_id)
+        if scenario is None:
+            raise InvalidCustomFailurePlan("Custom plan references an unknown scenario.")
+
+        data = self._read_json("failure_scenarios.json")
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            raise DatasetError("Failure dataset metadata must be an object.")
+        units = meta.get("units")
+        tick_s = units.get("tick_s") if isinstance(units, dict) else None
+        event_types = meta.get("event_types")
+        status_values = meta.get("event_status_values")
+        message_types = meta.get("message_types")
+        if (
+            not self._is_positive_int(tick_s)
+            or not isinstance(event_types, dict)
+            or not self._string_list(status_values)
+            or not self._string_list(message_types)
+        ):
+            raise DatasetError("Failure dataset metadata is invalid.")
+
+        allowed_custom_types = {
+            "controller_outage",
+            "drone_unresponsive",
+            "network_partition",
+        }
+        if not isinstance(custom_events, list) or not 1 <= len(custom_events) <= 10:
+            raise InvalidCustomFailurePlan("A custom plan must contain 1 to 10 events.")
+
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(custom_events, start=1):
+            if not isinstance(item, dict) or item.get("type") not in allowed_custom_types:
+                raise InvalidCustomFailurePlan(
+                    "Custom plans support controller_outage, network_partition, and drone_unresponsive events only."
+                )
+            start_tick = item.get("start_tick")
+            restore_tick = item.get("restore_tick")
+            if (
+                not self._is_positive_int(start_tick)
+                or start_tick > 100_000
+                or (restore_tick is not None and (
+                    not self._is_positive_int(restore_tick)
+                    or restore_tick > 100_000
+                    or restore_tick <= start_tick
+                ))
+            ):
+                raise InvalidCustomFailurePlan(
+                    "Event start_tick must be 1–100000 and restore_tick, when set, must be later."
+                )
+            event_type = item["type"]
+            if event_type != "drone_unresponsive" and restore_tick is None:
+                raise InvalidCustomFailurePlan(
+                    f"{event_type} requires a restore_tick; only drone_unresponsive may be permanent."
+                )
+
+            start_s = start_tick * tick_s
+            end_s = restore_tick * tick_s if restore_tick is not None else None
+            event: dict[str, Any] = {
+                "id": f"C{index:02d}",
+                "type": event_type,
+                "start_s": start_s,
+                "end_s": end_s,
+                "status": "scheduled",
+            }
+            if end_s is not None:
+                event["duration_s"] = end_s - start_s
+
+            if event_type == "controller_outage":
+                event.update({
+                    "target": "central_controller",
+                    "severity": "full",
+                    "cause": "power_failure",
+                })
+            elif event_type == "drone_unresponsive":
+                event.update({
+                    "drone_id": item.get("drone_id"),
+                    "recovers": restore_tick is not None,
+                    "cause": "hardware_fault",
+                })
+            else:
+                event.update({
+                    "groups": item.get("groups"),
+                    "cause": "interference",
+                })
+
+            if event_type in {"controller_outage", "network_partition"}:
+                recovery = item.get("reconnection")
+                if not isinstance(recovery, dict):
+                    raise InvalidCustomFailurePlan(
+                        f"{event_type} requires reconnection timing in ticks."
+                    )
+                tick_fields = (
+                    "detect_timeout_ticks",
+                    "reconnect_delay_ticks",
+                    "resync_time_ticks",
+                )
+                if any(
+                    not self._is_nonnegative_int(recovery.get(field))
+                    or recovery[field] > 10_000
+                    for field in tick_fields
+                ):
+                    raise InvalidCustomFailurePlan(
+                        "Reconnection timing fields must be integer tick counts from 0 to 10000."
+                    )
+                event["reconnection"] = {
+                    "detect_timeout_s": recovery["detect_timeout_ticks"] * tick_s,
+                    "reconnect_delay_s": recovery["reconnect_delay_ticks"] * tick_s,
+                    "resync_time_s": recovery["resync_time_ticks"] * tick_s,
+                    "total_recovery_s": (
+                        recovery["reconnect_delay_ticks"]
+                        + recovery["resync_time_ticks"]
+                    ) * tick_s,
+                    "state_sync": "delta",
+                }
+
+            normalized.append(event)
+
+        self._validate_custom_conflicts(custom_events)
+        event_ids: set[str] = set()
+        drone_ids = {drone.drone_id for drone in scenario.drones}
+        for event in normalized:
+            try:
+                self._validate_failure_event(
+                    event,
+                    tick_s=tick_s,
+                    event_types=set(event_types),
+                    event_status_values=set(status_values),
+                    drone_ids=drone_ids,
+                    message_types=set(message_types),
+                    scenario_by_id=scenario_by_id,
+                    event_ids=event_ids,
+                )
+            except DatasetError as exc:
+                raise InvalidCustomFailurePlan(str(exc)) from exc
+
+        return CustomFailureScheduleDefinition(
+            scenario_id=scenario_id,
+            tick_s=tick_s,
+            event_status_values=tuple(status_values),
+            events=tuple(normalized),
+        )
+
+    @staticmethod
+    def _validate_custom_conflicts(events: list[dict[str, Any]]) -> None:
+        intervals: list[tuple[str, str | None, int, int | None]] = []
+        for event in events:
+            event_type = event["type"]
+            target = event.get("drone_id") if event_type == "drone_unresponsive" else None
+            start = event["start_tick"]
+            end = event["restore_tick"]
+            if event_type in {"controller_outage", "network_partition"} and end is not None:
+                recovery = event.get("reconnection", {})
+                end += recovery.get("reconnect_delay_ticks", 0) + recovery.get("resync_time_ticks", 0)
+            if event_type == "drone_unresponsive" and end is None:
+                end = 100_001
+            for prior_type, prior_target, prior_start, prior_end in intervals:
+                same_resource = (
+                    event_type == prior_type
+                    and (event_type != "drone_unresponsive" or target == prior_target)
+                )
+                if same_resource and max(start, prior_start) < min(end or 100_001, prior_end or 100_001):
+                    raise InvalidCustomFailurePlan(
+                        "Overlapping events affecting the same controller, partition, or drone are not allowed."
+                    )
+            intervals.append((event_type, target, start, end))
 
     def _validate_failure_event(
         self,

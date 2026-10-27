@@ -5,9 +5,8 @@ import type { CoordinationMode } from '../api'
 const MODES: [CoordinationMode, string, string][] = [['centralized', 'Centralized', 'A single controller assigns every task. Efficient, but a controller outage stalls the fleet.'], ['decentralized', 'Decentralized', 'Drones coordinate locally. Resilient, but risks duplicate work and conflicts.'], ['hybrid', 'Hybrid RESQNET', 'Central planning with local fallback when the network fails, then state reconciliation.']]
 const icon = (t: string) => /flood|water/i.test(t) ? '🌊' : /earth|quake|collapse/i.test(t) ? '🏚' : /fire/i.test(t) ? '🔥' : '⚠'
 export default function Scenarios() {
-  const { scenarios, scenarioId, setScenario, mode, setMode, start, error, busy, failScen, failId, setFailScenario } = useStore()
-  const fs = failScen.find((x: any) => x.failure_scenario_id === failId)
-  const nav = useNavigate(); const go = async () => { await start(); nav('/mission') }
+  const { scenarios, scenarioId, setScenario, mode, setMode, start, error, busy } = useStore()
+  const nav = useNavigate(); const go = async () => { if (await start()) nav('/mission') }
   return (
     <div className="page">
       <div><h1>Select <b>scenario</b></h1><p className="sub">Disaster layouts, obstacles and failure conditions. Grid, blocked cells and drones come from the backend.</p></div>
@@ -24,14 +23,9 @@ export default function Scenarios() {
       </div>
       <div className="card"><h3>Coordination mode</h3>
         <div className="grid3">{MODES.map(([v, l, d]) => <div key={v} className={'card scn ' + (mode === v ? 'on' : '')} onClick={() => setMode(v)}><b>{l}</b><p className="mut" style={{ margin: '6px 0 0' }}>{d}</p></div>)}</div></div>
-      <div className="card"><h3>Failure condition</h3>
-        <label className="f" style={{ marginBottom: 10 }}>Failure scenario (from failure_scenarios.json)
-          <select value={failId} onChange={(e) => setFailScenario(e.target.value)}><option value="">— no failure schedule —</option>{failScen.map((x: any) => <option key={x.failure_scenario_id} value={x.failure_scenario_id}>{x.title}</option>)}</select></label>
-        {fs && <div style={{ marginBottom: 12 }}><p style={{ margin: '0 0 6px' }}>{fs.description} <span className="mut">Tests: {fs.tests}.</span></p>
-          {!!fs.events.length && <table><thead><tr><th>Event</th><th>Type</th><th>Start (s)</th><th>End (s)</th><th>Detail</th></tr></thead><tbody>{fs.events.map((e: any) => <tr key={e.id}><td className="mono">{e.id}</td><td>{e.type}</td><td className="mono">{e.start_s}</td><td className="mono">{e.end_s ?? 'never'}</td><td className="mut">{e.drone_id ? `drone ${e.drone_id}` : e.groups ? e.groups.map((g: any) => `${g.group_id}: ${g.drone_ids.join('/')}${g.has_controller_link ? ' (controller)' : ''}`).join(' · ') : e.scope ?? ''}</td></tr>)}</tbody></table>}
-          <p className="mut" style={{ margin: '6px 0 0' }}>Expected checks: {fs.expected_checks.join(' · ')}. Schedule times use {useStore.getState().droneCfg?.meta?.units?.tick_s ?? 2} seconds per tick. The backend updates event lifecycle and marks an unresponsive drone disconnected; it does not simulate communication delivery, coordination failover, battery, or no-fly effects.</p></div>}
+      <div className="card"><h3>Failure plan</h3>
         <PlanEditor />
-        <p className="mut">The selected schedule is sent to the backend immediately after each run is created, before simulation ticks advance. Comparison runs receive the same schedule.</p></div>
+        <p className="mut">The selected predefined schedule or validated custom plan is installed after run creation and before the first tick. Experiment comparisons apply the same plan to each mode.</p></div>
       <div className="row"><button className="primary" disabled={!scenarioId || busy} onClick={go}>{busy ? 'Creating run…' : '▶ Analyze & Start Mission'}</button></div>
     </div>)
 }

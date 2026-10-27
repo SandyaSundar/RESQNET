@@ -6,6 +6,7 @@ from itertools import combinations, permutations
 from uuid import uuid4
 
 from app.simulation.loader import (
+    CustomFailureScheduleDefinition,
     FailureScenarioDefinition,
     ScenarioDefinition,
     TaskDefinition,
@@ -84,6 +85,8 @@ class SimulationEngine:
         self._movement_priority_offset = 0
         self._yield_goals: dict[str, tuple[int, int]] = {}
         self.failure_scenario_id: str | None = None
+        self.failure_schedule_type: str | None = None
+        self._failure_schedule_installed = False
         self._failure_tick_s: int | None = None
         self._failure_status_values: dict[str, str] = {}
         self._failure_events: list[dict[str, object]] = []
@@ -144,46 +147,92 @@ class SimulationEngine:
         self,
         schedule: FailureScenarioDefinition,
     ) -> dict[str, object]:
-        if schedule.scenario_id != self.scenario.scenario_id:
+        if self.tick != 0:
+            raise FailureScheduleConflict(
+                "A failure schedule must be installed before advancing the run."
+            )
+        if self._failure_schedule_installed:
+            if (
+                self.failure_schedule_type == "predefined"
+                and self.failure_scenario_id == schedule.failure_scenario_id
+            ):
+                return self.get_state()
+            raise FailureScheduleConflict("A failure schedule is already installed for this run.")
+        return self._commit_failure_schedule(
+            scenario_id=schedule.scenario_id,
+            tick_s=schedule.tick_s,
+            events=schedule.events,
+            event_status_values=schedule.event_status_values,
+            schedule_type="predefined",
+            failure_scenario_id=schedule.failure_scenario_id,
+            test_matrix_entry=schedule.test_matrix_entry,
+        )
+
+    def install_custom_failure_schedule(
+        self,
+        schedule: CustomFailureScheduleDefinition,
+    ) -> dict[str, object]:
+        if self.tick != 0:
+            raise FailureScheduleConflict(
+                "A failure schedule must be installed before advancing the run."
+            )
+        if self._failure_schedule_installed:
+            raise FailureScheduleConflict("A failure schedule is already installed for this run.")
+        return self._commit_failure_schedule(
+            scenario_id=schedule.scenario_id,
+            tick_s=schedule.tick_s,
+            events=schedule.events,
+            event_status_values=schedule.event_status_values,
+            schedule_type="custom",
+            failure_scenario_id=None,
+            test_matrix_entry=None,
+        )
+
+    def _commit_failure_schedule(
+        self,
+        *,
+        scenario_id: str,
+        tick_s: int,
+        events: tuple[dict[str, object], ...],
+        event_status_values: tuple[str, ...],
+        schedule_type: str,
+        failure_scenario_id: str | None,
+        test_matrix_entry: dict[str, object] | None,
+    ) -> dict[str, object]:
+        if scenario_id != self.scenario.scenario_id:
             raise ValueError("Failure schedule scenario does not match the run.")
-        if (
-            not isinstance(schedule.tick_s, int)
-            or isinstance(schedule.tick_s, bool)
-            or schedule.tick_s <= 0
-        ):
+        if not isinstance(tick_s, int) or isinstance(tick_s, bool) or tick_s <= 0:
             raise ValueError("Failure schedule tick duration is invalid.")
         if self.tick != 0:
             raise FailureScheduleConflict(
                 "A failure schedule must be installed before advancing the run."
             )
-        if self.failure_scenario_id is not None:
-            if self.failure_scenario_id == schedule.failure_scenario_id:
-                return self.get_state()
-            raise FailureScheduleConflict("A failure schedule is already installed for this run.")
 
-        events = deepcopy(list(schedule.events))
-        if any(not isinstance(event, dict) for event in events):
+        copied_events = deepcopy(list(events))
+        if any(not isinstance(event, dict) for event in copied_events):
             raise ValueError("Failure schedule events have not been validated.")
-        event_ids = [event.get("id") for event in events]
+        event_ids = [event.get("id") for event in copied_events]
         if (
             any(not isinstance(event_id, str) or not event_id for event_id in event_ids)
             or len(event_ids) != len(set(event_ids))
-            or any(event.get("status") != "scheduled" for event in events)
+            or any(event.get("status") != "scheduled" for event in copied_events)
             or not {"scheduled", "active", "recovering", "resolved"}.issubset(
-                set(schedule.event_status_values)
+                set(event_status_values)
             )
         ):
             raise ValueError("Failure schedule events have not been validated.")
 
         # Commit the validated schedule only after all checks have passed.
-        self.failure_scenario_id = schedule.failure_scenario_id
-        self._failure_tick_s = schedule.tick_s
+        self.failure_scenario_id = failure_scenario_id
+        self.failure_schedule_type = schedule_type
+        self._failure_schedule_installed = True
+        self._failure_tick_s = tick_s
         self._failure_status_values = {
             value: value
             for value in ("scheduled", "active", "recovering", "resolved")
         }
-        self._failure_events = events
-        self._failure_test_matrix_entry = deepcopy(schedule.test_matrix_entry)
+        self._failure_events = copied_events
+        self._failure_test_matrix_entry = deepcopy(test_matrix_entry)
         self._update_failure_events()
         return self.get_state()
 
@@ -530,6 +579,7 @@ class SimulationEngine:
                 for candidate in self.scenario.candidate_detections
             ],
             "failure_scenario_id": self.failure_scenario_id,
+            "failure_schedule_type": self.failure_schedule_type,
             "failure_events": deepcopy(self._failure_events),
             "failure_test_matrix_entry": deepcopy(self._failure_test_matrix_entry),
         }

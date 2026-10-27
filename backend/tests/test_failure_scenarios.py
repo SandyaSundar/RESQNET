@@ -9,6 +9,7 @@ from app.simulation.loader import (
     DatasetError,
     FailureScenarioNotFound,
     IncompatibleFailureScenario,
+    InvalidCustomFailurePlan,
     ScenarioLoader,
 )
 
@@ -109,3 +110,56 @@ def test_malformed_failure_events_are_rejected(
 
     with pytest.raises(DatasetError, match=message):
         ScenarioLoader(data_dir).load_failure_scenario("drone_failure", "earthquake")
+
+
+def test_custom_schedule_converts_ticks_and_uses_dataset_event_fields() -> None:
+    schedule = ScenarioLoader(DATA_DIR).load_custom_failure_schedule(
+        "earthquake",
+        [{
+            "type": "controller_outage",
+            "start_tick": 3,
+            "restore_tick": 8,
+            "reconnection": {
+                "detect_timeout_ticks": 2,
+                "reconnect_delay_ticks": 3,
+                "resync_time_ticks": 4,
+            },
+        }],
+    )
+
+    event = schedule.events[0]
+    assert schedule.tick_s == 2
+    assert event["start_s"] == 6
+    assert event["end_s"] == 16
+    assert event["duration_s"] == 10
+    assert event["target"] == "central_controller"
+    assert event["reconnection"] == {
+        "detect_timeout_s": 4,
+        "reconnect_delay_s": 6,
+        "resync_time_s": 8,
+        "total_recovery_s": 14,
+        "state_sync": "delta",
+    }
+
+
+def test_custom_schedule_rejects_unsupported_types_and_conflicting_events() -> None:
+    loader = ScenarioLoader(DATA_DIR)
+    with pytest.raises(InvalidCustomFailurePlan, match="support"):
+        loader.load_custom_failure_schedule(
+            "earthquake",
+            [{"type": "packet_loss", "start_tick": 1, "restore_tick": 2}],
+        )
+
+    recovery = {
+        "detect_timeout_ticks": 1,
+        "reconnect_delay_ticks": 1,
+        "resync_time_ticks": 1,
+    }
+    with pytest.raises(InvalidCustomFailurePlan, match="Overlapping"):
+        loader.load_custom_failure_schedule(
+            "earthquake",
+            [
+                {"type": "controller_outage", "start_tick": 1, "restore_tick": 5, "reconnection": recovery},
+                {"type": "controller_outage", "start_tick": 6, "restore_tick": 9, "reconnection": recovery},
+            ],
+        )

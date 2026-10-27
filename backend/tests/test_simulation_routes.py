@@ -7,6 +7,25 @@ from app.simulation.loader import IncompatibleFailureScenario
 client = TestClient(app)
 
 
+def _custom_controller_plan(start_tick: int = 2, restore_tick: int = 4) -> dict:
+    return {
+        "custom_plan": {
+            "events": [
+                {
+                    "type": "controller_outage",
+                    "start_tick": start_tick,
+                    "restore_tick": restore_tick,
+                    "reconnection": {
+                        "detect_timeout_ticks": 1,
+                        "reconnect_delay_ticks": 1,
+                        "resync_time_ticks": 1,
+                    },
+                }
+            ]
+        }
+    }
+
+
 def test_list_scenarios_returns_real_dataset() -> None:
     response = client.get("/api/simulations/scenarios")
 
@@ -35,6 +54,7 @@ def test_frontend_dataset_endpoints_and_production_cors() -> None:
     assert preflight.headers["access-control-allow-origin"] == (
         "https://resqnet-eight-psi.vercel.app"
     )
+    assert preflight.headers["access-control-allow-credentials"] == "true"
 
 
 def test_create_advance_and_retrieve_run() -> None:
@@ -283,3 +303,191 @@ def test_incompatible_failure_schedule_does_not_change_run_state(monkeypatch) ->
     state = client.get(f"/api/simulations/{run_id}").json()
     assert state["failure_scenario_id"] is None
     assert state["failure_events"] == []
+
+
+def test_custom_plan_is_installed_on_run_and_restores_hybrid_controller() -> None:
+    created = client.post(
+        "/api/simulations",
+        json={"scenario_id": "earthquake", "mode": "hybrid"},
+    )
+    run_id = created.json()["run_id"]
+
+    installed = client.post(
+        f"/api/simulations/{run_id}/failures",
+        json=_custom_controller_plan(),
+    )
+
+    assert installed.status_code == 200
+    assert installed.json()["failure_schedule_type"] == "custom"
+    assert installed.json()["failure_scenario_id"] is None
+    assert installed.json()["failure_test_matrix_entry"] is None
+    assert installed.json()["tick"] == 0
+    assert installed.json()["failure_events"][0]["start_s"] == 4
+    assert installed.json()["failure_events"][0]["end_s"] == 8
+    assert installed.json()["failure_events"][0]["status"] == "scheduled"
+
+    active = client.post(f"/api/simulations/{run_id}/ticks", json={"ticks": 2})
+    assert active.status_code == 200
+    assert active.json()["failure_events"][0]["status"] == "active"
+    assert active.json()["operational_strategy"] == "decentralized_fallback"
+    assert active.json()["controller_available"] is False
+
+    restoring = client.post(f"/api/simulations/{run_id}/ticks", json={"ticks": 2})
+    assert restoring.json()["failure_events"][0]["status"] == "recovering"
+
+    resync = client.post(f"/api/simulations/{run_id}/ticks", json={"ticks": 1})
+    assert resync.json()["operational_strategy"] == "reconciliation"
+    assert resync.json()["reconciliation_history"]
+
+    restored = client.post(f"/api/simulations/{run_id}/ticks", json={"ticks": 1})
+    assert restored.json()["failure_events"][0]["status"] == "resolved"
+    assert restored.json()["operational_strategy"] == "centralized_allocation"
+
+
+def test_custom_plan_does_not_leak_between_runs_and_compares_across_modes() -> None:
+    plans = []
+    runs = []
+    for mode in ("centralized", "decentralized", "hybrid"):
+        created = client.post(
+            "/api/simulations",
+            json={"scenario_id": "earthquake", "mode": mode},
+        )
+        assert created.status_code == 201
+        run_id = created.json()["run_id"]
+        runs.append(run_id)
+        installed = client.post(
+            f"/api/simulations/{run_id}/failures",
+            json=_custom_controller_plan(),
+        )
+        assert installed.status_code == 200
+        plans.append(installed.json()["failure_events"])
+
+    assert plans[0] == plans[1] == plans[2]
+    untouched = client.post(
+        "/api/simulations",
+        json={"scenario_id": "earthquake"},
+    ).json()
+    assert untouched["failure_schedule_type"] is None
+    assert untouched["failure_events"] == []
+    assert all(client.get(f"/api/simulations/{run_id}").json()["tick"] == 0 for run_id in runs)
+
+
+def test_custom_unresponsive_drone_uses_existing_disconnected_status() -> None:
+    created = client.post(
+        "/api/simulations",
+        json={"scenario_id": "earthquake", "mode": "decentralized"},
+    )
+    run_id = created.json()["run_id"]
+    installed = client.post(
+        f"/api/simulations/{run_id}/failures",
+        json={"custom_plan": {"events": [{
+            "type": "drone_unresponsive",
+            "start_tick": 1,
+            "restore_tick": None,
+            "drone_id": "D3",
+        }]}},
+    )
+    assert installed.status_code == 200
+    assert installed.json()["failure_events"][0]["end_s"] is None
+
+    advanced = client.post(f"/api/simulations/{run_id}/ticks", json={"ticks": 1})
+    drone = next(item for item in advanced.json()["drones"] if item["drone_id"] == "D3")
+    assert drone["status"] == "disconnected"
+
+    recovering_run = client.post(
+        "/api/simulations",
+        json={"scenario_id": "earthquake", "mode": "decentralized"},
+    ).json()["run_id"]
+    recovering_install = client.post(
+        f"/api/simulations/{recovering_run}/failures",
+        json={"custom_plan": {"events": [{
+            "type": "drone_unresponsive",
+            "start_tick": 1,
+            "restore_tick": 3,
+            "drone_id": "D3",
+        }]}},
+    )
+    assert recovering_install.status_code == 200
+    client.post(f"/api/simulations/{recovering_run}/ticks", json={"ticks": 1})
+    restored = client.post(f"/api/simulations/{recovering_run}/ticks", json={"ticks": 2})
+    restored_drone = next(item for item in restored.json()["drones"] if item["drone_id"] == "D3")
+    assert restored.json()["failure_events"][0]["status"] == "resolved"
+    assert restored_drone["status"] != "disconnected"
+
+
+def test_custom_network_partition_uses_declared_groups_for_hybrid_fallback() -> None:
+    created = client.post(
+        "/api/simulations",
+        json={"scenario_id": "earthquake", "mode": "hybrid"},
+    )
+    run_id = created.json()["run_id"]
+    installed = client.post(
+        f"/api/simulations/{run_id}/failures",
+        json={"custom_plan": {"events": [{
+            "type": "network_partition",
+            "start_tick": 1,
+            "restore_tick": 3,
+            "groups": [
+                {"group_id": "controller", "drone_ids": ["D1", "D2", "D3"], "has_controller_link": True},
+                {"group_id": "local", "drone_ids": ["D4", "D5", "D6"], "has_controller_link": False},
+            ],
+            "reconnection": {
+                "detect_timeout_ticks": 1,
+                "reconnect_delay_ticks": 1,
+                "resync_time_ticks": 1,
+            },
+        }]}},
+    )
+    assert installed.status_code == 200
+
+    active = client.post(f"/api/simulations/{run_id}/ticks", json={"ticks": 1})
+    state = active.json()
+    assert state["failure_events"][0]["status"] == "active"
+    assert state["operational_strategy"] == "decentralized_fallback"
+    assert state["partition_state"][0]["groups"][1]["drone_ids"] == ["D4", "D5", "D6"]
+
+
+def test_custom_failure_plan_rejects_unsupported_invalid_and_conflicting_events() -> None:
+    created = client.post("/api/simulations", json={"scenario_id": "earthquake"})
+    run_id = created.json()["run_id"]
+    invalid_requests = [
+        {"custom_plan": {"events": [{"type": "packet_loss", "start_tick": 1, "restore_tick": 2}]}},
+        {"custom_plan": {"events": [{"type": "controller_outage", "start_tick": 2, "restore_tick": 2, "reconnection": {"detect_timeout_ticks": 1, "reconnect_delay_ticks": 1, "resync_time_ticks": 1}}]}},
+        {"custom_plan": {"events": [{"type": "drone_unresponsive", "start_tick": 1, "restore_tick": 2, "drone_id": "D99"}]}},
+        {"custom_plan": {"events": [{"type": "network_partition", "start_tick": 1, "restore_tick": 4, "groups": [{"group_id": "A", "drone_ids": ["D1", "D2"], "has_controller_link": True}, {"group_id": "B", "drone_ids": ["D3", "D4", "D5"], "has_controller_link": False}], "reconnection": {"detect_timeout_ticks": 1, "reconnect_delay_ticks": 1, "resync_time_ticks": 1}}]}},
+        {"custom_plan": {"events": [
+            {"type": "controller_outage", "start_tick": 2, "restore_tick": 8, "reconnection": {"detect_timeout_ticks": 1, "reconnect_delay_ticks": 1, "resync_time_ticks": 1}},
+            {"type": "controller_outage", "start_tick": 7, "restore_tick": 10, "reconnection": {"detect_timeout_ticks": 1, "reconnect_delay_ticks": 1, "resync_time_ticks": 1}},
+        ]}},
+    ]
+    for payload in invalid_requests:
+        response = client.post(f"/api/simulations/{run_id}/failures", json=payload)
+        assert response.status_code == 422
+        assert client.get(f"/api/simulations/{run_id}").json()["failure_schedule_type"] is None
+
+
+def test_custom_plan_rejects_too_many_events_and_oversized_payload() -> None:
+    created = client.post("/api/simulations", json={"scenario_id": "earthquake"})
+    run_id = created.json()["run_id"]
+    event = {
+        "type": "drone_unresponsive",
+        "start_tick": 1,
+        "restore_tick": None,
+        "drone_id": "D1",
+    }
+    too_many = client.post(
+        f"/api/simulations/{run_id}/failures",
+        json={"custom_plan": {"events": [event] * 11}},
+    )
+    assert too_many.status_code == 422
+
+    body = b" " * 65_537 + (
+        b'{"custom_plan":{"events":[{"type":"drone_unresponsive",'
+        b'"start_tick":1,"restore_tick":null,"drone_id":"D1"}]}}'
+    )
+    oversized = client.post(
+        f"/api/simulations/{run_id}/failures",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    assert oversized.status_code == 413

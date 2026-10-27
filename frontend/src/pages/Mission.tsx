@@ -108,8 +108,8 @@ export default function Mission() {
             {!s.alerts.length && <span className="mut">No alerts.</span>}</div>
           <button style={{ width: '100%', marginTop: 8 }} disabled={!unack} onClick={s.ackAll}>Acknowledge All</button></div>
         <div className="card"><h3>Failure schedule</h3>
-          {run.failure_scenario_id
-            ? <><p className="mut">{run.failure_scenario_id} · scheduled relative to mission start</p>
+          {run.failure_schedule_type || run.failure_scenario_id
+            ? <><p className="mut">{run.failure_schedule_type === 'custom' ? 'Custom user-authored plan' : run.failure_scenario_id} · scheduled relative to mission start</p>
               {!!run.failure_events?.length && <table><thead><tr><th>Event</th><th>Type</th><th>Start</th><th>End</th><th>Status</th></tr></thead><tbody>
                 {run.failure_events.map((event: any) => <tr key={event.id}><td className="mono">{event.id}</td><td>{event.type}</td><td className="mono">{event.start_s}s</td><td className="mono">{event.end_s == null ? 'never' : `${event.end_s}s`}</td><td>{event.status}</td></tr>)}
               </tbody></table>}
