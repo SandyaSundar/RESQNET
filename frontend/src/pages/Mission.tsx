@@ -6,8 +6,8 @@ import { useStore } from '../store'
 import { label, latlon } from '../geo'
 import { batteryOf, connOf, dname, healthOf, mmss } from '../lib'
 import { batClass } from '../batteryColor'
+import type { CoordinationMode } from '../api'
 
-const FAIL: [string, string, string][] = [['controller_outage', 'Disable central controller', 'danger'], ['network_partition', 'Inject network partition', 'danger'], ['drone_unresponsive', 'Disconnect drone', 'danger'], ['restore_connectivity', 'Restore connectivity', '']]
 export default function Mission() {
   const s = useStore(); const { run } = s
   const [dF, setDF] = useState(''); const [sF, setSF] = useState('all')
@@ -25,17 +25,18 @@ export default function Mission() {
         <button className="sm" disabled={s.running || s.busy || s.archived} onClick={() => s.step()}>Step</button>
         <button className="sm" disabled={s.busy} onClick={s.start}>↻ Restart</button>
         <button className="sm danger" onClick={s.reset}>■ Reset</button></>}
-      <span className="mono mut" style={{ fontSize: 11 }}>{s.mode.toUpperCase()}{run ? ` · ${mmss(run.tick * s.secPerTick)}` : ''}</span>
+      <span className="mono mut" style={{ fontSize: 11 }}>{(run?.coordination_mode ?? s.mode).toUpperCase()}{run ? ` · ${mmss(run.tick * s.secPerTick)}` : ''}</span>
     </div>)
 
   if (!run) return (
     <div className="mc" style={{ gridTemplateRows: 'minmax(0,1fr)' }}>
       <div className="col"><div className="card fill"><h3>Active aircraft</h3><p className="mut">Drones appear here once a run is created from the backend.</p></div></div>
       <MapView>{ctl}<div className="overlay"><div className="card" style={{ width: 360 }}>
-        <h3>No active run</h3>
+        <h3>No active mission</h3>
+        <p className="mut" style={{ margin: '0 0 12px' }}>Choose a scenario and coordination mode, then select Start mission to begin a simulation.</p>
         <div style={{ display: 'grid', gap: 10 }}>
           <label className="f">Scenario<select value={s.scenarioId} onChange={(e) => s.setScenario(e.target.value)}>{s.scenarios.map((x: any) => <option key={x.scenario_id} value={x.scenario_id}>{x.name}</option>)}</select></label>
-          <label className="f">Mode<select value={s.mode} onChange={(e) => s.setMode(e.target.value)}><option value="centralized">Centralized</option><option value="decentralized">Decentralized</option><option value="hybrid">Hybrid RESQNET</option></select></label>
+          <label className="f">Mode<select value={s.mode} onChange={(e) => s.setMode(e.target.value as CoordinationMode)}><option value="centralized">Centralized</option><option value="decentralized">Decentralized</option><option value="hybrid">Hybrid RESQNET</option></select></label>
           {s.error && <div className="err">{s.error}</div>}
           <button className="primary" disabled={!s.scenarioId || s.busy} onClick={s.start}>{s.busy ? 'Creating run…' : '▶ Start mission'}</button>
           <Link className="btn" to="/scenarios">Choose layout & failure condition</Link></div></div></div></MapView>
@@ -47,6 +48,20 @@ export default function Mission() {
   const sysCls = discN ? 'bad' : s.obs.dupNow || unack ? 'warn' : ''
   const evs = s.events.filter((e) => (sF === 'all' || e.sev === sF) && (!dF || e.drone === dF))
   const topTasks = [...run.tasks].sort((a: any, b: any) => (b.priority ?? 0) - (a.priority ?? 0)).slice(0, 7)
+  const isDecentralized = run.coordination_mode === 'decentralized'
+  const isHybrid = run.coordination_mode === 'hybrid'
+  const showClaims = isDecentralized || isHybrid
+  const claimCounts = showClaims ? run.tasks.reduce((counts: Record<string, number>, task: any) => {
+    counts[task.claim_status] = (counts[task.claim_status] || 0) + 1
+    return counts
+  }, {}) : {}
+  const releasedClaimCount = showClaims ? run.tasks.reduce((total: number, task: any) => total + (task.released_claims?.length || 0), 0) : 0
+  const reconciliationHistory = isHybrid && Array.isArray(run.reconciliation_history) ? run.reconciliation_history : []
+  const strategyLabels: Record<string, string> = {
+    centralized_allocation: 'Centralized allocation',
+    decentralized_fallback: 'Decentralized fallback',
+    reconciliation: 'Reconciliation',
+  }
   const inProg = run.tasks.filter((t: any) => t.status !== 'completed' && t.status !== 'pending' && t.status !== 'blocked').length
   const last3 = s.handoffs.slice(0, 3).reverse()
 
@@ -72,6 +87,7 @@ export default function Mission() {
           <div className="mut" style={{ fontSize: 10.5 }}>* battery modelled from drone_config.json drain rates (the backend state has no battery field).</div>
         </div>
         <div className="card sys"><h3>System status</h3>
+          <div className="r">Coordination mode<b className="badge">{run.coordination_mode ?? s.mode}</b></div>
           <div className="r">◇ Total aircraft<b>{run.drones.length}</b></div><div className="r">◉ Active missions<b>{inProg}</b></div>
           <div className="r c-a">▲ Alerts<b>{unack}</b></div><div className="r">⇄ Ownership conflicts<b className={s.obs.dupNow ? 'c-r' : ''}>{s.obs.dupNow}</b></div>
           <div className={'sysok ' + sysCls}>● {discN ? `${discN} DRONE(S) DISCONNECTED` : s.obs.dupNow ? 'CONFLICTS UNRESOLVED' : 'All systems normal'}</div>
@@ -91,11 +107,15 @@ export default function Mission() {
               <span className={'ai ' + a.sev}>{a.sev === 'error' ? '!' : a.sev === 'warn' ? '▲' : 'i'}</span><div><b>{a.title}</b><span>{a.detail}</span><br /><small>{a.t} · tick {a.tick}</small></div></div>)}
             {!s.alerts.length && <span className="mut">No alerts.</span>}</div>
           <button style={{ width: '100%', marginTop: 8 }} disabled={!unack} onClick={s.ackAll}>Acknowledge All</button></div>
-        <div className="card"><h3>Failure injection</h3>
-          <div style={{ display: 'grid', gap: 6 }}>
-            {FAIL.map(([t, l, c]) => <button key={t} className={c + ' sm'} disabled={s.archived} onClick={() => s.inject(t, t === 'drone_unresponsive' ? { drone_id: s.selected || run.drones[0]?.drone_id } : {})}>{t === 'drone_unresponsive' ? `${l} ${s.selected || run.drones[0]?.drone_id}` : l}</button>)}</div>
-          {s.lastInjection && <div className={s.lastInjection.ok ? 'okbox' : 'err'} style={{ marginTop: 8, fontSize: 11 }}><b>{s.lastInjection.type}</b>: {s.lastInjection.ok ? 'backend accepted ' : s.lastInjection.text.startsWith('Unsupported:') ? 'unsupported ' : 'backend error '}<span className="mono">{s.lastInjection.text}</span></div>}
-          <p className="mut" style={{ fontSize: 10.5, margin: '8px 0 0' }}>Failure injection is unsupported by this backend and will not be sent. Scripted failure: {s.plan.type === 'none' ? 'none' : `${s.plan.type} @ tick ${s.plan.tick}`}.</p></div>
+        <div className="card"><h3>Failure schedule</h3>
+          {run.failure_scenario_id
+            ? <><p className="mut">{run.failure_scenario_id} · scheduled relative to mission start</p>
+              {!!run.failure_events?.length && <table><thead><tr><th>Event</th><th>Type</th><th>Start</th><th>End</th><th>Status</th></tr></thead><tbody>
+                {run.failure_events.map((event: any) => <tr key={event.id}><td className="mono">{event.id}</td><td>{event.type}</td><td className="mono">{event.start_s}s</td><td className="mono">{event.end_s == null ? 'never' : `${event.end_s}s`}</td><td>{event.status}</td></tr>)}
+              </tbody></table>}
+            </>
+            : <p className="mut">No failure schedule is installed for this run.</p>}
+          <p className="mut" style={{ fontSize: 10.5, margin: '8px 0 0' }}>An unresponsive drone is marked disconnected. Other event types show their lifecycle only; controller, partition, packet-loss, delay, battery, and no-fly effects are not simulated.</p></div>
         <div className="card"><h3>Mission status</h3>
           <div className="mono" style={{ lineHeight: 1.7, fontSize: 12 }}>Elapsed {mmss(run.tick * s.secPerTick)} · Remaining tasks {total - done}<br />Coverage {run.coverage.percentage}% ({run.coverage.visited_cells}/{run.coverage.traversable_cells})</div>
           <div className="meter"><i style={{ width: `${total ? (done / total) * 100 : 0}%`, background: 'var(--cy)' }} /></div>
@@ -103,6 +123,48 @@ export default function Mission() {
             return <div className="ms" key={t.task_id}><span className={'ck ' + st}>{st === '' ? '✓' : st === 'blocked' ? '!' : st === 'pending' ? '…' : '▶'}</span><div><small>{t.task_id} · P{t.priority}</small><span className="mut" style={{ fontSize: 11 }}>{t.status} · {(t.assigned_to || []).join(', ') || 'unassigned'}</span></div></div> })}</div>
           {(run.candidate_detections || []).length > 0 && <p className="mut" style={{ fontSize: 11 }}>Unverified candidates: {(run.candidate_detections || []).filter((c: any) => c.verification_status !== 'confirmed').length} (observations, not confirmed rescues)</p>}
         </div>
+        {isHybrid && <div className="card"><h3>Hybrid coordination</h3>
+          <div className="hybrid-strategy"><span className="mut">Operational strategy</span><b className="badge">{strategyLabels[run.operational_strategy] || run.operational_strategy || 'Unavailable'}</b></div>
+          <div className="hybrid-links">
+            <span>Controller service <b className={run.controller_available ? 'c-g' : 'c-r'}>{run.controller_available == null ? 'unknown' : run.controller_available ? 'available' : 'unavailable'}</b></span>
+            <span>Controller reachable <b className={run.controller_reachable ? 'c-g' : 'c-r'}>{run.controller_reachable == null ? 'unknown' : run.controller_reachable ? 'yes' : 'no'}</b></span>
+          </div>
+          {run.operational_strategy === 'decentralized_fallback' && <p className="mut hybrid-note">{!run.controller_available ? 'Fallback is active because the controller is unavailable.' : run.partition_state?.length ? 'Fallback is active for drones outside the controller linked partition group.' : 'Local coordination is active while connectivity recovers.'}</p>}
+          {!!run.partition_state?.length && <div className="partition-groups"><b>Active network partition</b>{run.partition_state.flatMap((partition: any) => partition.groups.map((group: any) => <div className="partition-group" key={`${partition.event_id}-${group.group_id}`}><span>Group {group.group_id}</span><span>{group.has_controller_link ? 'Controller linked' : 'Local coordination'}</span><span className="mono">{group.drone_ids.join(', ')}</span></div>))}</div>}
+          <div className="hybrid-history"><b>Recovery and reconciliation</b>
+            {reconciliationHistory.length
+              ? reconciliationHistory.slice(-6).reverse().map((action: any, index: number) => <div className="mut claim-detail" key={`${action.event_id}-${action.task_id}-${action.drone_id || action.action}-${index}`}>
+                Tick {action.tick} · {action.task_id} · {action.action.split('_').join(' ')}{action.drone_id ? ` · ${action.drone_id}` : ''}{action.reason ? ` · ${action.reason}` : ''}
+              </div>)
+              : <p className="mut claim-empty">No reconciliation has occurred in this run.</p>}
+          </div>
+          {run.operational_strategy === 'centralized_allocation' && reconciliationHistory.length > 0 && <p className="mut hybrid-note">Centralized allocation is active again after reconciliation.</p>}
+        </div>}
+        {showClaims && <div className="card"><h3><span className="grow">{isHybrid ? 'Hybrid task ownership' : 'Decentralized task claims'}</span><span className="badge">{run.tasks.length} tasks</span></h3>
+          <div className="claim-summary">
+            <span>Claimed <b>{claimCounts.claimed || 0}</b></span><span>Unclaimed <b>{claimCounts.unclaimed || 0}</b></span><span>Completed <b>{claimCounts.completed || 0}</b></span>
+          </div>
+          <div className="claim-list">
+            {run.tasks.map((task: any) => {
+              const claims = Array.isArray(task.claims) ? task.claims : []
+              const released = Array.isArray(task.released_claims) ? task.released_claims : []
+              const completed = task.claim_status === 'completed'
+              return <article className="claim-task" key={task.task_id}>
+                <div className="claim-heading"><b>{task.task_id}</b><span className={'claim-state ' + (completed ? 'complete' : task.claim_status)}>{task.claim_status}</span></div>
+                <div className="mut claim-detail">Task status: {task.status} · {completed ? `team size ${claims.length}/${task.required_drones}` : `owners ${claims.length}/${task.required_drones}`}</div>
+                {claims.length > 0
+                  ? <div className="claim-owners">{completed ? 'Recorded claims' : 'Current owners'}: {claims.map((claim: any) => `${claim.drone_id} (tick ${claim.claim_tick ?? 'unavailable'}${claim.group_id ? ` · ${claim.group_id}` : ''})`).join(', ')}</div>
+                  : <div className="mut claim-detail">{completed ? 'No claim records returned.' : 'No active owners.'}</div>}
+                {released.length > 0 && <details className="claim-history"><summary>Released claims ({released.length})</summary>
+                  {released.map((claim: any, index: number) => <div className="mut claim-detail" key={`${claim.drone_id}-${claim.released_tick}-${index}`}>
+                    {claim.drone_id} · claim tick {claim.claim_tick ?? 'unavailable'} · released tick {claim.released_tick ?? 'unavailable'} · {claim.reason}
+                  </div>)}
+                </details>}
+              </article>
+            })}
+          </div>
+          {releasedClaimCount === 0 && <p className="mut claim-empty">No claim releases have been recorded for this run.</p>}
+        </div>}
       </div>
 
       <div className="bottom">

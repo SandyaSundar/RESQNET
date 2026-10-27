@@ -16,6 +16,14 @@ class DatasetError(ValueError):
     pass
 
 
+class FailureScenarioNotFound(ValueError):
+    pass
+
+
+class IncompatibleFailureScenario(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class TaskDefinition:
     task_id: str
@@ -58,6 +66,16 @@ class ScenarioDefinition:
     tasks: tuple[TaskDefinition, ...]
     drones: tuple[DroneDefinition, ...]
     candidate_detections: tuple[CandidateDetection, ...]
+
+
+@dataclass(frozen=True)
+class FailureScenarioDefinition:
+    failure_scenario_id: str
+    scenario_id: str
+    tick_s: int
+    event_status_values: tuple[str, ...]
+    events: tuple[dict[str, Any], ...]
+    test_matrix_entry: dict[str, Any]
 
 
 class ScenarioLoader:
@@ -130,6 +148,315 @@ class ScenarioLoader:
         ):
             raise DatasetError("Failure test matrix references an unknown scenario.")
         return definitions
+
+    def load_failure_scenario(
+        self,
+        failure_scenario_id: str,
+        scenario_id: str,
+    ) -> FailureScenarioDefinition:
+        """Return a validated failure schedule and its compatible matrix entry.
+
+        The existing ``load_all`` return value remains the scenario tuple. This
+        method exposes failure data separately for callers that need to install
+        a schedule on a live simulation.
+        """
+        scenarios = self.load_all()
+        scenario_by_id = {scenario.scenario_id: scenario for scenario in scenarios}
+        scenario = scenario_by_id.get(scenario_id)
+        if scenario is None:
+            raise DatasetError("Failure schedule references an unknown scenario.")
+
+        data = self._read_json("failure_scenarios.json")
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            raise DatasetError("Failure dataset metadata must be an object.")
+
+        units = meta.get("units")
+        tick_s = units.get("tick_s") if isinstance(units, dict) else None
+        if not self._is_positive_int(tick_s):
+            raise DatasetError("Failure dataset tick_s must be a positive integer.")
+
+        event_types = meta.get("event_types")
+        event_status_values = meta.get("event_status_values")
+        drone_ids = meta.get("drone_ids")
+        message_types = meta.get("message_types")
+        modes = meta.get("modes")
+        if (
+            not isinstance(event_types, dict)
+            or not event_types
+            or any(not isinstance(key, str) or not isinstance(value, str) for key, value in event_types.items())
+            or not self._string_list(event_status_values)
+            or not {"scheduled", "active", "recovering", "resolved"}.issubset(event_status_values)
+            or len(set(event_status_values)) != len(event_status_values)
+            or not self._string_list(drone_ids)
+            or not drone_ids
+            or len(set(drone_ids)) != len(drone_ids)
+            or not self._string_list(message_types)
+            or not message_types
+            or len(set(message_types)) != len(message_types)
+            or not self._string_list(modes)
+            or not modes
+            or len(set(modes)) != len(modes)
+        ):
+            raise DatasetError("Failure dataset metadata is invalid.")
+
+        failure_scenarios = data.get("failure_scenarios")
+        test_matrix = data.get("test_matrix")
+        if not isinstance(failure_scenarios, list) or not isinstance(test_matrix, list):
+            raise DatasetError("Failure data must contain scenario and test lists.")
+
+        failures_by_id: dict[str, dict[str, Any]] = {}
+        for failure in failure_scenarios:
+            if not isinstance(failure, dict):
+                raise DatasetError("Failure scenario entries must be objects.")
+            failure_id = failure.get("failure_scenario_id")
+            events = failure.get("events")
+            if not isinstance(failure_id, str) or not failure_id or failure_id in failures_by_id:
+                raise DatasetError("Failure scenario IDs must be present and unique.")
+            if not isinstance(events, list):
+                raise DatasetError("Failure scenario events must be lists.")
+            event_ids: set[str] = set()
+            for event in events:
+                self._validate_failure_event(
+                    event,
+                    tick_s=tick_s,
+                    event_types=set(event_types),
+                    event_status_values=set(event_status_values),
+                    drone_ids=set(drone_ids),
+                    message_types=set(message_types),
+                    scenario_by_id=scenario_by_id,
+                    event_ids=event_ids,
+                )
+            failures_by_id[failure_id] = failure
+
+        matrix_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+        matrix_run_ids: set[str] = set()
+        for entry in test_matrix:
+            if not isinstance(entry, dict):
+                raise DatasetError("Failure test matrix entries must be objects.")
+            run_id = entry.get("run_id")
+            failure_id = entry.get("failure_scenario_id")
+            matrix_scenario_id = entry.get("scenario_id")
+            entry_modes = entry.get("modes")
+            seeds = entry.get("seeds")
+            if (
+                not isinstance(run_id, str)
+                or not run_id
+                or run_id in matrix_run_ids
+                or not isinstance(failure_id, str)
+                or failure_id not in failures_by_id
+                or not isinstance(matrix_scenario_id, str)
+                or matrix_scenario_id not in scenario_by_id
+                or not self._string_list(entry_modes)
+                or not entry_modes
+                or any(mode not in modes for mode in entry_modes)
+                or not isinstance(seeds, list)
+                or not seeds
+                or any(not self._is_nonnegative_int(seed) for seed in seeds)
+                or not isinstance(entry.get("same_inputs_across_modes"), bool)
+            ):
+                raise DatasetError("Failure test matrix entries are invalid.")
+            matrix_run_ids.add(run_id)
+            pair = (failure_id, matrix_scenario_id)
+            if pair in matrix_by_pair:
+                raise DatasetError("Failure test matrix pairs must be unique.")
+            matrix_by_pair[pair] = entry
+
+        failure = failures_by_id.get(failure_scenario_id)
+        if failure is None:
+            raise FailureScenarioNotFound(failure_scenario_id)
+        matrix_entry = matrix_by_pair.get((failure_scenario_id, scenario_id))
+        if matrix_entry is None:
+            raise IncompatibleFailureScenario(
+                f"Failure scenario {failure_scenario_id} is not configured for {scenario_id}."
+            )
+        return FailureScenarioDefinition(
+            failure_scenario_id=failure_scenario_id,
+            scenario_id=scenario_id,
+            tick_s=tick_s,
+            event_status_values=tuple(event_status_values),
+            events=tuple(dict(event) for event in failure["events"]),
+            test_matrix_entry=dict(matrix_entry),
+        )
+
+    def _validate_failure_event(
+        self,
+        event: Any,
+        *,
+        tick_s: int,
+        event_types: set[str],
+        event_status_values: set[str],
+        drone_ids: set[str],
+        message_types: set[str],
+        scenario_by_id: dict[str, ScenarioDefinition],
+        event_ids: set[str],
+    ) -> None:
+        if not isinstance(event, dict):
+            raise DatasetError("Failure events must be objects.")
+        event_id = event.get("id")
+        event_type = event.get("type")
+        start_s = event.get("start_s")
+        end_s = event.get("end_s")
+        if (
+            not isinstance(event_id, str)
+            or not event_id
+            or event_id in event_ids
+            or not isinstance(event_type, str)
+            or event_type not in event_types
+            or "end_s" not in event
+            or not self._is_nonnegative_int(start_s)
+            or start_s % tick_s != 0
+            or (end_s is not None and (not self._is_nonnegative_int(end_s) or end_s < start_s or end_s % tick_s != 0))
+            or not isinstance(event.get("status"), str)
+            or event.get("status") not in event_status_values
+            or event.get("status") != "scheduled"
+        ):
+            raise DatasetError("Failure event identity, type, timing, or status is invalid.")
+        event_ids.add(event_id)
+
+        drone_id = event.get("drone_id")
+        if drone_id is not None and (
+            not isinstance(drone_id, str) or drone_id not in drone_ids
+        ):
+            raise DatasetError("Failure event references an unknown drone.")
+        listed_drones = event.get("drone_ids", [])
+        if (
+            not isinstance(listed_drones, list)
+            or any(not isinstance(item, str) or item not in drone_ids for item in listed_drones)
+            or len(set(listed_drones)) != len(listed_drones)
+        ):
+            raise DatasetError("Failure event drone_ids are invalid.")
+        affected_types = event.get("affected_message_types", [])
+        if (
+            not isinstance(affected_types, list)
+            or any(not isinstance(item, str) or item not in message_types for item in affected_types)
+        ):
+            raise DatasetError("Failure event message types are invalid.")
+
+        if "reconnection" in event:
+            recovery = event["reconnection"]
+            if not isinstance(recovery, dict):
+                raise DatasetError("Failure event reconnection data must be an object.")
+            recovery_fields = (
+                "detect_timeout_s",
+                "reconnect_delay_s",
+                "resync_time_s",
+                "total_recovery_s",
+            )
+            if any(not self._is_nonnegative_int(recovery.get(field)) for field in recovery_fields):
+                raise DatasetError("Failure event reconnection times are invalid.")
+            if recovery["total_recovery_s"] != recovery["reconnect_delay_s"] + recovery["resync_time_s"]:
+                raise DatasetError("Failure event total_recovery_s does not match its components.")
+            if recovery["total_recovery_s"] % tick_s != 0:
+                raise DatasetError("Failure event recovery time must align to a simulation tick.")
+
+        if event_type == "controller_outage":
+            if (
+                not isinstance(event.get("target"), str)
+                or not isinstance(event.get("severity"), str)
+                or not isinstance(event.get("cause"), str)
+                or "reconnection" not in event
+            ):
+                raise DatasetError("Controller outage event fields are invalid.")
+        elif event_type == "drone_unresponsive":
+            if not isinstance(drone_id, str) or not isinstance(event.get("recovers"), bool):
+                raise DatasetError("Drone failure event fields are invalid.")
+            if not isinstance(event.get("cause"), str):
+                raise DatasetError("Drone failure cause is invalid.")
+            if end_s is None and event["recovers"]:
+                raise DatasetError("An event with null end_s cannot be marked recoverable.")
+            if end_s is not None and not event["recovers"]:
+                raise DatasetError("A non-null end_s must agree with the event's recovers value.")
+        elif event_type == "network_partition":
+            groups = event.get("groups")
+            if not isinstance(groups, list) or not groups or not isinstance(event.get("cause"), str) or "reconnection" not in event:
+                raise DatasetError("Network partition groups are invalid.")
+            group_ids: set[str] = set()
+            partitioned_drones: set[str] = set()
+            for group in groups:
+                if (
+                    not isinstance(group, dict)
+                    or not isinstance(group.get("group_id"), str)
+                    or group["group_id"] in group_ids
+                    or not isinstance(group.get("has_controller_link"), bool)
+                    or not isinstance(group.get("drone_ids"), list)
+                    or not group["drone_ids"]
+                    or any(
+                        not isinstance(item, str) or item not in drone_ids
+                        for item in group["drone_ids"]
+                    )
+                    or any(item in partitioned_drones for item in group["drone_ids"])
+                ):
+                    raise DatasetError("Network partition group entries are invalid.")
+                group_ids.add(group["group_id"])
+                partitioned_drones.update(group["drone_ids"])
+            if partitioned_drones != drone_ids:
+                raise DatasetError("Network partition groups must cover the declared drones.")
+        elif event_type == "packet_loss":
+            loss_pct = event.get("loss_pct")
+            if (
+                not isinstance(event.get("scope"), str)
+                or not isinstance(event.get("pattern"), str)
+                or ("burst_len_packets" in event and not self._is_positive_int(event["burst_len_packets"]))
+                or not listed_drones
+                or isinstance(loss_pct, bool)
+                or not isinstance(loss_pct, (int, float))
+                or not 0 <= loss_pct <= 100
+                or not affected_types
+            ):
+                raise DatasetError("Packet loss event fields are invalid.")
+        elif event_type == "message_delay":
+            probabilities = ("reorder_probability", "duplicate_probability")
+            numeric_fields = ("base_delay_ms", "jitter_ms", "max_delay_ms")
+            if (
+                not isinstance(event.get("scope"), str)
+                or not affected_types
+                or any(not self._is_nonnegative_int(event.get(field)) for field in numeric_fields)
+                or event["max_delay_ms"] < event["base_delay_ms"]
+                or any(
+                    isinstance(event.get(field), bool)
+                    or not isinstance(event.get(field), (int, float))
+                    or not 0 <= event[field] <= 1
+                    for field in probabilities
+                )
+            ):
+                raise DatasetError("Message delay event fields are invalid.")
+        elif event_type == "battery_override":
+            overrides = event.get("overrides")
+            if not isinstance(overrides, list) or not overrides:
+                raise DatasetError("Battery override entries are invalid.")
+            override_ids: set[str] = set()
+            for override in overrides:
+                if (
+                    not isinstance(override, dict)
+                    or not isinstance(override.get("drone_id"), str)
+                    or override.get("drone_id") not in drone_ids
+                    or override["drone_id"] in override_ids
+                    or not self._is_nonnegative_int(override.get("battery_pct"))
+                    or override["battery_pct"] > 100
+                ):
+                    raise DatasetError("Battery override entry is invalid.")
+                override_ids.add(override["drone_id"])
+        elif event_type == "no_fly_activation":
+            cells_by_scenario = event.get("cells_by_scenario")
+            if not isinstance(cells_by_scenario, dict) or not cells_by_scenario or not isinstance(event.get("reason"), str):
+                raise DatasetError("No-fly scenario cells are invalid.")
+            for scenario_id, cells in cells_by_scenario.items():
+                scenario = scenario_by_id.get(scenario_id)
+                if scenario is None or not isinstance(cells, list) or not cells:
+                    raise DatasetError("No-fly event references an invalid scenario or cell list.")
+                seen_cells: set[tuple[int, int]] = set()
+                for cell in cells:
+                    if (
+                        not isinstance(cell, list)
+                        or len(cell) != 2
+                        or not all(self._is_nonnegative_int(value) for value in cell)
+                        or cell[0] >= scenario.width
+                        or cell[1] >= scenario.height
+                        or tuple(cell) in seen_cells
+                    ):
+                        raise DatasetError("No-fly event cell coordinates are invalid.")
+                    seen_cells.add(tuple(cell))
 
     def _read_json(self, filename: str) -> dict[str, Any]:
         path = self.data_dir / filename
@@ -390,6 +717,10 @@ class ScenarioLoader:
         if not isinstance(value, str) or not value:
             raise DatasetError(f"Required string field {key} is invalid.")
         return value
+
+    @staticmethod
+    def _string_list(value: Any) -> bool:
+        return isinstance(value, list) and all(isinstance(item, str) and item for item in value)
 
     @staticmethod
     def _is_nonnegative_int(value: Any) -> bool:

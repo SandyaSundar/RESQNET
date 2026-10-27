@@ -2,6 +2,8 @@
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/+$/, '')
 const apiUrl = (path: string) => `${BACKEND_URL}${path}`
 
+export type CoordinationMode = 'centralized' | 'decentralized' | 'hybrid'
+
 async function req(path: string, init?: RequestInit) {
   const r = await fetch(apiUrl(path), { ...init, headers: { 'Content-Type': 'application/json' } })
   let body: any = null
@@ -18,13 +20,13 @@ export const api = {
     finally { clearTimeout(t) }
   },
   scenarios: () => req('/api/simulations/scenarios'),
-  create: (scenario_id: string, mode?: string) => req('/api/simulations', { method: 'POST', body: JSON.stringify({ scenario_id, mode }) }),
+  create: (scenario_id: string, mode: CoordinationMode = 'centralized') => req('/api/simulations', { method: 'POST', body: JSON.stringify({ scenario_id, mode }) }),
   tick: (id: string, ticks = 1) => req(`/api/simulations/${id}/ticks`, { method: 'POST', body: JSON.stringify({ ticks }) }),
   state: (id: string) => req(`/api/simulations/${id}`),
   droneConfig: () => req('/api/datasets/drone-config'),
   failureScenarios: () => req('/api/datasets/failure-scenarios'),
-  // Failure injection is not implemented by this backend; surface that limitation without pretending it succeeded.
-  inject: async (_id: string, _type: string, _payload: any = {}) => {
-    throw new Error('Unsupported: failure injection is not implemented by the backend.')
-  },
+  installFailureSchedule: (id: string, failure_scenario_id: string) => req(
+    `/api/simulations/${id}/failures`,
+    { method: 'POST', body: JSON.stringify({ failure_scenario_id }) },
+  ),
 }
