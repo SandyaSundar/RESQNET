@@ -1,13 +1,11 @@
 import { create } from 'zustand'
-import { api } from './api'
-import { Obs, emptyObs, observe, rowsOf, summary, dname } from './lib'
+import { api, type CoordinationMode, type CustomFailureEvent, validateCustomFailurePlan } from './api'
+import { Obs, emptyObs, observe, summary } from './lib'
 
 export type Sev = 'info' | 'warn' | 'error'
 export type Ev = { id: number; t: string; iso: string; tick: number; sev: Sev; cat: string; drone?: string; msg: string }
-export type Alert = { id: number; title: string; detail: string; t: string; tick: number; sev: Sev; ack: boolean; drone?: string }
 export type Handoff = { id: number; tick: number; t: string; task: string; from: string; to: string; x: number; y: number }
-export type FailType = 'none' | 'controller_outage' | 'network_partition' | 'drone_unresponsive'
-export type Plan = { type: FailType; tick: number; drone: string; restoreAfter: number }
+export type HazardPriority = { priority_level: number; priority_label: string }
 
 const load = (k: string, d: any) => { try { const v = JSON.parse(localStorage.getItem(k) || ''); return v ?? d } catch { return d } }
 const persist = (k: string, v: any) => { try { localStorage.setItem(k, JSON.stringify(v)); return true } catch { return false } }
@@ -15,51 +13,51 @@ const now = () => new Date().toLocaleTimeString('en-GB')
 let uid = 1
 const mk = (tick: number, sev: Sev, cat: string, msg: string, drone?: string): Ev => ({ id: uid++, t: now(), iso: new Date().toISOString(), tick, sev, cat, msg, drone })
 
-// The hosted backend can take up to ~50 s to wake up on the first visit, so initial loads are retried
-// (every 4 s, about 80 s in total) instead of failing on the first attempt.
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
-async function retry<T>(fn: () => Promise<T>, tries = 20, gap = 4000): Promise<T> {
-  let last: any
-  for (let i = 0; i < tries; i++) { try { return await fn() } catch (e) { last = e; if (i < tries - 1) await sleep(gap) } }
-  throw last
-}
-const SLOW = 'Live data is taking a little longer than usual. Please refresh the page in a moment.'
-
 interface S {
   droneCfg: any | null; failScen: any[]; failId: string; setFailScenario: (id: string) => void
-  scenarios: any[]; scenarioId: string; mode: string; plan: Plan; planStage: number
+  failureSource: 'none' | 'predefined' | 'custom'; setFailureSource: (source: 'none' | 'predefined' | 'custom') => void
+  customPlan: CustomFailureEvent[]; setCustomPlan: (events: CustomFailureEvent[]) => void
+  scenarios: any[]; scenarioId: string; mode: CoordinationMode
   run: any | null; archived: boolean; trails: Record<string, [number, number][]>; visited: Set<string>; dist: Record<string, number>; bat: Record<string, number>; lastSeen: Record<string, number>
-  events: Ev[]; alerts: Alert[]; handoffs: Handoff[]; active: Record<string, 1>; obs: Obs
+  events: Ev[]; handoffs: Handoff[]; active: Record<string, 1>; obs: Obs
+  hazards: Record<string, HazardPriority>; setHazards: (h: Record<string, HazardPriority>) => void
   covHistory: { tick: number; cov: number; done: number; disc: number; dup: number }[]
-  lastInjection: { type: string; ok: boolean; text: string } | null
-  running: boolean; busy: boolean; error: string; health: string; warming: boolean
+  running: boolean; busy: boolean; error: string; health: string; booting: boolean
   speedMs: number; ticksPerStep: number; selected: string; seed: string; basemap: 'satellite' | 'dark'; secPerTick: number
   saved: any[]; comparison: any[]; cmpProgress: string
-  boot: () => Promise<void>; setScenario: (id: string) => void; setMode: (m: string) => void; setPlan: (p: Partial<Plan>) => void
-  start: () => Promise<void>; step: () => Promise<void>; setRunning: (b: boolean) => void; reset: () => void
+  boot: () => Promise<void>; setScenario: (id: string) => void; setMode: (m: CoordinationMode) => void
+  start: () => Promise<boolean>; step: () => Promise<void>; setRunning: (b: boolean) => void; reset: () => void
   setSpeed: (n: number) => void; setTicksPerStep: (n: number) => void; select: (id: string) => void
   setSeed: (s: string) => void; setBasemap: (b: 'satellite' | 'dark') => void; setSecPerTick: (n: number) => void
-  inject: (type: string, payload?: any) => Promise<void>; saveRun: () => void; openSaved: (id: string) => Promise<boolean>; deleteSaved: (id: string) => void
-  addNote: (cat: string, msg: string, sev?: Sev) => void; ackAll: () => void; ack: (id: number) => void
+  saveRun: () => void; openSaved: (id: string) => Promise<boolean>; deleteSaved: (id: string) => void
+  addNote: (cat: string, msg: string, sev?: Sev) => void
   compare: (ticks: number) => Promise<void>; saveComparison: () => void; clearSaved: () => void; wipeLocal: () => void
 }
 
-const fresh = () => ({ run: null, archived: false, trails: {}, visited: new Set<string>(), dist: {}, bat: {}, lastSeen: {}, events: [], alerts: [], handoffs: [], active: {}, obs: emptyObs(), covHistory: [], planStage: 0, lastInjection: null })
+const fresh = () => ({ run: null, archived: false, trails: {}, visited: new Set<string>(), dist: {}, bat: {}, lastSeen: {}, events: [], handoffs: [], active: {}, obs: emptyObs(), covHistory: [] })
+const initialFailId = localStorage.getItem('rq_fail') || ''
+const storedFailureSource = localStorage.getItem('rq_schedule_source')
+const initialFailureSource: S['failureSource'] = storedFailureSource === 'none' || storedFailureSource === 'predefined' || storedFailureSource === 'custom'
+  ? storedFailureSource
+  : initialFailId ? 'predefined' : 'none'
+const loadedCustomPlan = load('rq_custom_plan', [])
+const scenarioDroneIds = (scenarioId: string, droneCfg: any) =>
+  (droneCfg?.fleets?.find((fleet: any) => fleet.scenario_id === scenarioId)?.drones || [])
+    .map((drone: any) => drone.id)
 
-// Compare previous and next backend state -> events, alerts, handoffs, conflicts (everything derived from real data)
+// Compare previous and next backend state -> events, handoffs, conflicts (derived from real data).
+// Frontend-generated alerts and "task blocked" warnings were intentionally removed.
 function absorb(s: S, next: any) {
   const prev = s.run; const tick = next.tick
-  const evs: Ev[] = []; const als: Alert[] = []; const hands: Handoff[] = []
-  const active = { ...s.active }; const rows = rowsOf(next.grid)
-  const alert = (sev: Sev, title: string, detail: string, drone?: string) => als.push({ id: uid++, title, detail, t: now(), tick, sev, ack: false, drone })
-  const on = (key: string, cond: boolean, onTrue: () => void, onFalse?: () => void) => { if (cond && !active[key]) { active[key] = 1; onTrue() } else if (!cond && active[key]) { delete active[key]; onFalse?.() } }
+  const evs: Ev[] = []; const hands: Handoff[] = []
+  const active = { ...s.active }
 
   if (prev) {
     const pt: any = Object.fromEntries(prev.tasks.map((t: any) => [t.task_id, t]))
     for (const t of next.tasks) {
       const o = pt[t.task_id]; if (!o) continue
       const a0: string[] = o.assigned_to || []; const a1: string[] = t.assigned_to || []
-      if (o.status !== t.status) evs.push(mk(tick, t.status === 'blocked' ? 'warn' : 'info', 'Task allocation', `Task ${t.task_id} ${o.status} → ${t.status}${a1.length ? ` (${a1.join(', ')})` : ''}`, a1[0]))
+      if (o.status !== t.status && o.status !== 'blocked' && t.status !== 'blocked') evs.push(mk(tick, 'info', 'Task allocation', `Task ${t.task_id} ${o.status} → ${t.status}${a1.length ? ` (${a1.join(', ')})` : ''}`, a1[0]))
       if (a0.length && a1.length && !a1.some((x) => a0.includes(x))) {
         hands.push({ id: uid++, tick, t: now(), task: t.task_id, from: a0[0], to: a1[0], x: t.x, y: t.y })
         evs.push(mk(tick, 'warn', 'Recovery', `Task ${t.task_id} reassigned ${a0.join(',')} → ${a1.join(',')}`, a1[0]))
@@ -76,7 +74,6 @@ function absorb(s: S, next: any) {
     }
   }
 
-  // Alerts: communication, restricted zone proximity, ownership conflicts, low battery
   const bat = { ...s.bat }
   const prevD: any = Object.fromEntries((prev?.drones || []).map((d: any) => [d.drone_id, d])); const dt = prev ? Math.max(0, tick - prev.tick) : 0
   for (const d of next.drones) { // battery modelled from drone_config.json (initial %, drain %/tick by activity)
@@ -92,82 +89,72 @@ function absorb(s: S, next: any) {
     if (!last || last[0] !== d.x || last[1] !== d.y) tr.push([d.x, d.y])
     visited.add(`${d.x},${d.y}`)
     if (d.status !== 'disconnected') lastSeen[d.drone_id] = tick
-    const id = d.drone_id
-    on(`disc:${id}`, d.status === 'disconnected', () => alert('error', 'Communication Lost', `${dname(id)} stopped reporting`, id), () => alert('info', 'Link Restored', `${dname(id)} reconnected`, id))
-    const here = rows[d.y]?.[d.x] === 'X'
-    let near = false
-    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) if (rows[d.y + dy]?.[d.x + dx] === 'X') near = true
-    on(`zin:${id}`, here, () => alert('error', 'Restricted Zone', `${dname(id)} inside boundary`, id))
-    on(`znear:${id}`, near && !here, () => alert('warn', 'Restricted Zone', `${dname(id)} near boundary`, id))
-    const bv = d.battery != null ? d.battery : bat[id] ?? 100
-    on(`bat:${id}`, bv < 25, () => alert('warn', 'Low Battery', `${dname(id)} at ${Math.round(bv)}% (return threshold 25%)`, id))
   }
-  for (const t of next.tasks) {
-    const dupe = (t.assigned_to || []).length > 1 && t.status !== 'completed'
-    on(`dup:${t.task_id}`, dupe, () => { alert('error', 'Conflicting Ownership', `Task ${t.task_id} owned by ${t.assigned_to.join(', ')}`); evs.push(mk(tick, 'error', 'Conflict', `Duplicate/conflicting ownership on ${t.task_id}: ${t.assigned_to.join(', ')}`)) },
-      () => evs.push(mk(tick, 'info', 'Reconciliation', `Ownership conflict on ${t.task_id} resolved`)))
-    on(`blk:${t.task_id}`, t.status === 'blocked', () => alert('warn', 'Task Blocked', `Task ${t.task_id} cannot proceed`))
-  }
+  
   const obs = observe(s.obs, next)
   return {
     run: next, trails, visited, dist, bat, lastSeen, active, obs,
-    events: [...evs.reverse(), ...s.events].slice(0, 600), alerts: [...als.reverse(), ...s.alerts].slice(0, 100), handoffs: [...hands, ...s.handoffs].slice(0, 50),
+    events: [...evs.reverse(), ...s.events].slice(0, 600), handoffs: [...hands, ...s.handoffs].slice(0, 50),
     covHistory: [...s.covHistory, { tick, cov: next.coverage?.percentage ?? 0, done: next.completed_tasks?.length ?? 0, disc: obs.discNow, dup: obs.dupNow }].slice(-800),
   }
 }
 
 export const useStore = create<S>((set, get) => ({
-  droneCfg: null, failScen: [], failId: localStorage.getItem('rq_fail') || '',
-  scenarios: [], scenarioId: localStorage.getItem('rq_scn') || '', mode: localStorage.getItem('rq_mode') || 'hybrid',
-  plan: load('rq_plan', { type: 'network_partition', tick: 30, drone: 'D3', restoreAfter: 30 }),
-  ...fresh(), running: false, busy: false, error: '', health: 'unknown', warming: true,
+  droneCfg: null, failScen: [], failId: initialFailId,
+  failureSource: initialFailureSource,
+  customPlan: Array.isArray(loadedCustomPlan) ? loadedCustomPlan : [],
+  scenarios: [], scenarioId: localStorage.getItem('rq_scn') || '', mode: (localStorage.getItem('rq_mode') as CoordinationMode) || 'hybrid',
+  ...fresh(), hazards: {}, running: false, busy: false, error: '', health: 'unknown', booting: false,
   speedMs: load('rq_speed', 700), ticksPerStep: load('rq_tps', 1), selected: '', seed: load('rq_seed', ''), basemap: load('rq_base', 'satellite'), secPerTick: load('rq_spt', 2),
   saved: load('rq_saved2', []), comparison: [], cmpProgress: '',
 
   boot: async () => {
-    set({ warming: true })
+    set({ booting: true })
     // Independent loads (a slow/hanging health check must never block scenarios or datasets).
-    // Scenarios, drone config and failure scenarios are retried while the hosted server wakes up.
     const health = api.health().then((h) => set({ health: h.status === 'ok' ? 'ok' : h.api === 'ok' ? 'db-offline' : 'unhealthy' }))
       .catch(() => set({ health: 'timeout' }))
-    const scn = retry(() => api.scenarios()).then((sc) => set({ scenarios: sc, scenarioId: get().scenarioId && sc.some((x: any) => x.scenario_id === get().scenarioId) ? get().scenarioId : sc[0]?.scenario_id || '' }))
-    const cfg = retry(() => api.droneConfig()).then((c) => set({ droneCfg: c }))
-    const fs = retry(() => api.failureScenarios()).then((f) => set({ failScen: f.failure_scenarios || [] }))
-    const res = await Promise.allSettled([health, scn, cfg, fs])
-    const failed = res.slice(1).some((r) => r.status === 'rejected')
-    set({ warming: false, error: failed && !get().scenarios.length ? SLOW : '' })
+    const scn = api.scenarios().then((sc) => set({ scenarios: sc, error: '', scenarioId: get().scenarioId && sc.some((x: any) => x.scenario_id === get().scenarioId) ? get().scenarioId : sc[0]?.scenario_id || '' }))
+      .catch((e: any) => set({ error: `Cannot load scenarios from backend: ${e.message}` }))
+    const cfg = api.droneConfig().then((c) => set({ droneCfg: c })).catch((e: any) => set({ error: `Cannot load drone config from backend: ${e.message}` }))
+    const fs = api.failureScenarios().then((f) => set({ failScen: f.failure_scenarios || [] })).catch((e: any) => set({ error: `Cannot load failure scenarios from backend: ${e.message}` }))
+    await Promise.allSettled([health, scn, cfg, fs])
     // Scenarios loaded but health failed/timed out => the API is up and only the database check is the problem.
     if (get().scenarios.length && !['ok', 'db-offline'].includes(get().health)) set({ health: 'db-offline' })
+    set({ booting: false })
   },
   setFailScenario: (id) => {
-    localStorage.setItem('rq_fail', id); set({ failId: id })
-    const sc = get().failScen.find((x: any) => x.failure_scenario_id === id); const tickS = get().droneCfg?.meta?.units?.tick_s ?? 2
-    const ev = sc?.events?.find((e: any) => ['controller_outage', 'network_partition', 'drone_unresponsive'].includes(e.type))
-    get().setPlan(ev ? { type: ev.type, tick: Math.max(1, Math.round(ev.start_s / tickS)), drone: ev.drone_id || get().plan.drone, restoreAfter: ev.end_s != null ? Math.round((ev.end_s - ev.start_s) / tickS) : 0 } : { type: 'none' })
+    localStorage.setItem('rq_fail', id)
+    const source = id ? 'predefined' : 'none'
+    localStorage.setItem('rq_schedule_source', source)
+    set({ failId: id, failureSource: source })
   },
+  setFailureSource: (source) => { localStorage.setItem('rq_schedule_source', source); set({ failureSource: source }) },
+  setCustomPlan: (events) => { persist('rq_custom_plan', events); set({ customPlan: events }) },
   setScenario: (id) => { localStorage.setItem('rq_scn', id); set({ scenarioId: id }) },
   setMode: (m) => { localStorage.setItem('rq_mode', m); set({ mode: m }) },
-  setPlan: (p) => { const plan = { ...get().plan, ...p }; persist('rq_plan', plan); set({ plan }) },
+  setHazards: (h) => set({ hazards: h }),
   start: async () => {
-    const { scenarioId, mode } = get(); if (!scenarioId) return
+    const { scenarioId, mode, failId, failureSource, customPlan, droneCfg } = get(); if (!scenarioId) return false
+    if (failureSource === 'predefined' && !failId) { set({ error: 'Choose a predefined failure schedule or select no failure schedule.' }); return false }
+    if (failureSource === 'custom') {
+      const errors = validateCustomFailurePlan(customPlan, scenarioDroneIds(scenarioId, droneCfg))
+      if (errors.length) { set({ error: errors.join(' ') }); return false }
+    }
     set({ busy: true, running: false })
     try {
-      const r = await api.create(scenarioId, mode)
+      let r = await api.create(scenarioId, mode)
+      if (failureSource === 'predefined' && failId) r = await api.installFailureSchedule(r.run_id, failId)
+      else if (failureSource === 'custom') r = await api.installCustomFailurePlan(r.run_id, customPlan)
       set({ ...fresh(), error: '', selected: '' })
       set((s) => ({ ...absorb(s, r), events: [mk(0, 'info', 'System', `Run ${r.run_id.slice(0, 8)} created (${scenarioId}, mode: ${mode})`)], busy: false, running: true }))
-    } catch (e: any) { set({ busy: false, error: e.message }) }
+      return true
+    } catch (e: any) { set({ busy: false, running: false, error: e.message }); return false }
   },
   step: async () => {
     const { run, busy, ticksPerStep, archived } = get(); if (!run || busy || archived) return
     set({ busy: true })
     try {
       const r = await api.tick(run.run_id, ticksPerStep); set((s) => ({ ...absorb(s, r), busy: false }))
-      // scripted failure condition from Scenarios (fires once, optional auto-restore)
-      const { plan, planStage } = get()
-      if (plan.type !== 'none') {
-        if (planStage === 0 && r.tick >= plan.tick) { set({ planStage: 1 }); await get().inject(plan.type, plan.type === 'drone_unresponsive' ? { drone_id: plan.drone } : {}) }
-        else if (planStage === 1 && plan.restoreAfter > 0 && r.tick >= plan.tick + plan.restoreAfter) { set({ planStage: 2 }); await get().inject('restore_connectivity') }
-      }
     } catch (e: any) { set({ busy: false, running: false, error: e.message }) }
   },
   setRunning: (b) => set({ running: b }),
@@ -178,25 +165,10 @@ export const useStore = create<S>((set, get) => ({
   setBasemap: (b) => { persist('rq_base', b); set({ basemap: b }) },
   setSecPerTick: (n) => { persist('rq_spt', n); set({ secPerTick: n }) },
   select: (id) => set({ selected: id }),
-  inject: async (type, payload) => {
-    const { run } = get(); if (!run || get().archived) return
-    try {
-      const r = await api.inject(run.run_id, type, payload)
-      const text = JSON.stringify(r).slice(0, 160)
-      set((s) => ({ lastInjection: { type, ok: true, text }, events: [mk(run.tick, 'warn', 'Failure', `Injected ${type}${payload?.drone_id ? ' on ' + payload.drone_id : ''}: backend replied ${text}`, payload?.drone_id), ...s.events] }))
-      if (r?.run_id && r?.tasks) set((s) => absorb(s, r))
-      else { try { const st = await api.state(run.run_id); set((s) => absorb(s, st)) } catch { /* ignore */ } }
-    } catch (e: any) {
-      set((s) => ({ lastInjection: { type, ok: false, text: e.message }, events: [mk(run.tick, 'error', 'Failure', `Injection "${type}" failed: ${e.message}`, payload?.drone_id), ...s.events],
-        alerts: [{ id: uid++, title: 'Injection Failed', detail: `${type}: ${e.message}`, t: now(), tick: run.tick, sev: 'error' as Sev, ack: false }, ...s.alerts] }))
-    }
-  },
   addNote: (cat, msg, sev = 'info') => { const { run } = get(); if (msg.trim()) set((s) => ({ events: [mk(run?.tick ?? 0, sev, cat, msg.trim()), ...s.events] })) },
-  ackAll: () => set((s) => ({ alerts: s.alerts.map((a) => ({ ...a, ack: true })) })),
-  ack: (id) => set((s) => ({ alerts: s.alerts.map((a) => (a.id === id ? { ...a, ack: true } : a)) })),
   saveRun: () => {
-    const { run, mode, saved, events, covHistory, handoffs, trails, visited, dist, obs, plan } = get(); if (!run) return
-    const rec = { ...summary(run, mode, obs, { plan }), detail: { run, events: events.slice(0, 300), covHistory: covHistory.slice(-300), handoffs, trails, visited: [...visited], dist, bat: get().bat, obs } }
+    const { run, mode, saved, events, covHistory, handoffs, trails, visited, dist, obs } = get(); if (!run) return
+    const rec = { ...summary(run, mode, obs), detail: { run, events: events.slice(0, 300), covHistory: covHistory.slice(-300), handoffs, trails, visited: [...visited], dist, bat: get().bat, obs } }
     let next = [rec, ...saved.filter((x: any) => x.run_id !== run.run_id)].slice(0, 20)
     while (next.length > 1 && !persist('rq_saved2', next)) next = next.slice(0, -1) // quota guard
     set({ saved: next })
@@ -213,28 +185,38 @@ export const useStore = create<S>((set, get) => ({
   },
   deleteSaved: (id) => { const next = get().saved.filter((x: any) => x.run_id !== id); persist('rq_saved2', next); set({ saved: next }) },
   clearSaved: () => { localStorage.removeItem('rq_saved2'); set({ saved: [] }) },
-  wipeLocal: () => { ['rq_saved2', 'rq_plan', 'rq_fail', 'rq_anchor', 'rq_seed', 'rq_base', 'rq_spt', 'rq_speed', 'rq_tps'].forEach((k) => localStorage.removeItem(k)); location.reload() },
-  // Same scenario, same tick budget, same scripted failure for every mode. Metrics are real backend output
-  // (or observed from real states); a failed injection is recorded as failed, never hidden.
+  wipeLocal: () => { ['rq_saved2', 'rq_plan', 'rq_fail', 'rq_schedule_source', 'rq_custom_plan', 'rq_anchor', 'rq_seed', 'rq_base', 'rq_spt', 'rq_speed', 'rq_tps'].forEach((k) => localStorage.removeItem(k)); location.reload() },
+  // Each compared run receives the same selected schedule before its first tick.
   compare: async (ticks) => {
-    const { scenarioId, plan } = get(); if (!scenarioId) return
+    const { scenarioId, failId, failureSource, customPlan, droneCfg } = get(); if (!scenarioId) return
+    if (failureSource === 'predefined' && !failId) { set({ error: 'Choose a predefined failure schedule or select no failure schedule.' }); return }
+    if (failureSource === 'custom') {
+      const errors = validateCustomFailurePlan(customPlan, scenarioDroneIds(scenarioId, droneCfg))
+      if (errors.length) { set({ error: errors.join(' ') }); return }
+    }
     set({ busy: true, comparison: [], error: '', cmpProgress: '' })
     try {
       const rows: any[] = []; const chunk = ticks > 300 ? 5 : 1
-      for (const m of ['centralized', 'decentralized', 'hybrid']) {
+      for (const m of ['centralized', 'decentralized', 'hybrid'] as CoordinationMode[]) {
         let r = await api.create(scenarioId, m); const id = r.run_id
-        let o = observe(emptyObs(), r); let stage = 0; let inj = plan.type === 'none' ? 'no failure scheduled' : 'pending'; let finished: number | null = null
-        while (r.tick < ticks) {
+        let injection = 'no failure schedule'
+        if (failureSource === 'predefined' && failId) {
+          r = await api.installFailureSchedule(id, failId)
+          injection = `${failId} schedule installed`
+        } else if (failureSource === 'custom') {
+          r = await api.installCustomFailurePlan(id, customPlan)
+          injection = `custom plan (${customPlan.length} events) installed`
+        }
+        let o = observe(emptyObs(), r)
+        let finished: number | null = r.mission_status === 'completed' ? r.tick : null
+        let tasksFinished: number | null = r.tasks_completed_tick ?? null
+        while (r.tick < ticks && r.mission_status !== 'completed') {
           set({ cmpProgress: `${m}: tick ${r.tick}/${ticks}` })
           r = await api.tick(id, Math.min(chunk, ticks - r.tick)); o = observe(o, r)
-          if (plan.type !== 'none') {
-            const fire = async (type: string, pl: any) => { try { const x = await api.inject(id, type, pl); inj = `${type}: OK ${JSON.stringify(x).slice(0, 60)}`; if (x?.tasks) { r = x; o = observe(o, r) } } catch (e: any) { inj = `${type}: FAILED (${e.message})` } }
-            if (stage === 0 && r.tick >= plan.tick) { stage = 1; await fire(plan.type, plan.type === 'drone_unresponsive' ? { drone_id: plan.drone } : {}) }
-            else if (stage === 1 && plan.restoreAfter > 0 && r.tick >= plan.tick + plan.restoreAfter) { stage = 2; await fire('restore_connectivity', {}) }
-          }
-          if (r.tasks.length && r.tasks.every((t: any) => t.status === 'completed')) { finished = r.tick; break }
+          if (tasksFinished == null && r.tasks_completed_tick != null) tasksFinished = r.tasks_completed_tick
+          if (r.mission_status === 'completed') finished = r.tick
         }
-        rows.push({ ...summary(r, m, o, { plan, injection: inj, finished }) }); set({ comparison: [...rows] })
+        rows.push({ ...summary(r, m, o, { injection, finished, tasksFinished }) }); set({ comparison: [...rows] })
       }
       set({ busy: false, cmpProgress: '' })
     } catch (e: any) { set({ busy: false, error: e.message, cmpProgress: '' }) }

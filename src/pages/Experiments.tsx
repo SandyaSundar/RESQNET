@@ -17,12 +17,12 @@ const grads = (p: string) => <defs>
 export default function Experiments() {
   const P = usePal(); const TT = tip(P)
   const legend = <Legend formatter={(val: any) => <span style={{ color: P.axis }}>{val}</span>} />
-  const { scenarioId, scenarios, comparison, compare, saveComparison, busy, error, cmpProgress, plan } = useStore()
+  const { scenarioId, scenarios, comparison, compare, saveComparison, busy, error, cmpProgress, failId, failScen, failureSource, customPlan } = useStore()
   const [ticks, setTicks] = useState(200)
   const sc = scenarios.find((x: any) => x.scenario_id === scenarioId)
   const best = (k: string, hi: boolean) => { const vals = comparison.map((r: any) => r[k]).filter((x: any) => typeof x === 'number'); return vals.length ? (hi ? Math.max(...vals) : Math.min(...vals)) : null }
   const cls = (r: any, k: string, hi: boolean) => (best(k, hi) != null && r[k] === best(k, hi) ? 'best-c' : '')
-  const rowsCsv = () => toCsv([['mode', 'run_id', 'coverage', 'completed', 'total_tasks', 'blocked', 'recovery', 'duplicates', 'comm_overhead', 'safety_violations', 'finished_tick', 'injection'], ...comparison.map((r: any) => [r.mode, r.run_id, r.coverage, r.completed, r.total_tasks, r.blocked, r.recovery, r.duplicates, r.comm, r.safety, r.finished, r.injection])])
+  const rowsCsv = () => toCsv([['mode', 'run_id', 'coverage', 'completed', 'total_tasks', 'blocked', 'recovery', 'duplicates', 'comm_overhead', 'safety_violations', 'mission_finished_tick', 'tasks_finished_tick', 'injection'], ...comparison.map((r: any) => [r.mode, r.run_id, r.coverage, r.completed, r.total_tasks, r.blocked, r.recovery, r.duplicates, r.comm, r.safety, r.finished, r.tasksFinished, r.injection])])
   return (
     <div className="page">
       <div><h1>Compare <b>strategies</b></h1><p className="sub">Centralized-only vs decentralized-only vs Hybrid RESQNET — same scenario, tick budget and failure condition.</p></div>
@@ -35,7 +35,8 @@ export default function Experiments() {
       {error && <div className="err">{error}</div>}
       {!!comparison.length && <>
         <div className="grid3">{comparison.map((r: any) => <div key={r.mode} className={'card cmpcard ' + (r.mode === 'hybrid' ? 'best' : '')}>
-          <h3>{NAME[r.mode]}<span className="grow" />{r.finished != null && <span className="badge">finished @ {r.finished}</span>}</h3>
+          <h3>{NAME[r.mode]}<span className="grow" />{r.finished != null && <span className="badge">mission @ {r.finished}</span>}</h3>
+          {r.tasksFinished != null && <div className="mut mono" style={{ fontSize: 11 }}>All tasks complete @ {r.tasksFinished}</div>}
           <div className="kpis" style={{ gridTemplateColumns: 'repeat(2,1fr)' }}>
             <div className="kpi"><span className="v c-c">{r.coverage}%</span><span className="l">Coverage</span></div><div className="kpi"><span className="v c-g">{r.completed}/{r.total_tasks}</span><span className="l">Tasks</span></div>
             <div className="kpi"><span className={'v ' + (r.recovery === 'NOT RECOVERED' ? 'c-r' : '')} style={{ fontSize: 17 }}>{r.recovery}</span><span className="l">Recovery</span></div><div className="kpi"><span className="v c-a">{v(r.duplicates)}</span><span className="l">Duplicates</span></div></div>
@@ -45,7 +46,7 @@ export default function Experiments() {
           <table><thead><tr><th>Mode</th><th>Coverage %</th><th>Tasks done</th><th>Blocked</th><th>Recovery time</th><th>Duplicate assign.</th><th>Comm. overhead</th><th>Safety violations</th></tr></thead>
             <tbody>{comparison.map((r: any) => <tr key={r.mode}><td><b>{NAME[r.mode]}</b></td><td className={'mono ' + cls(r, 'coverage', true)}>{r.coverage}</td><td className={'mono ' + cls(r, 'completed', true)}>{r.completed}/{r.total_tasks}</td><td className="mono">{r.blocked}</td>
               <td className={'mono ' + (r.recovery === 'NOT RECOVERED' ? 'c-r' : '')}>{r.recovery}</td><td className={'mono ' + cls(r, 'duplicates', false)}>{v(r.duplicates)}</td><td className="mono">{v(r.comm)}</td><td className={'mono ' + cls(r, 'safety', false)}>{v(r.safety)}</td></tr>)}</tbody></table>
-          <p className="mut">"—" = the backend did not return it and it cannot be observed. Duplicates, safety violations (drone inside a restricted/blocked cell) and recovery time are taken from the backend's metrics when present, otherwise observed from the real tick states. Results are shown as returned, including cases where hybrid is not best. Failure: {plan.type === 'none' ? 'none' : `${plan.type} @ tick ${plan.tick}`}.</p></div>
+          <p className="mut">"—" = the backend did not return it and it cannot be observed. Duplicates, safety violations (drone inside a restricted/blocked cell) and recovery time are taken from the backend's metrics when present, otherwise observed from the real tick states. Results are shown as returned, including cases where hybrid is not best. Failure plan: {failureSource === 'custom' ? `custom (${customPlan.length} events)` : failureSource === 'predefined' ? (failScen.find((item: any) => item.failure_scenario_id === failId)?.title ?? 'predefined schedule not selected') : 'none'}. Event lifecycle is tracked; communication effects are not simulated.</p></div>
         <div className="grid2">
           <div className="card" style={{ height: 300 }}><h3>Coverage & task completion</h3><ResponsiveContainer width="100%" height="88%"><BarChart data={comparison}>{grads('c1')}<CartesianGrid stroke={P.grid} strokeDasharray="3 3" /><XAxis dataKey="mode" stroke={P.axis} /><YAxis stroke={P.axis} /><Tooltip {...TT} />{legend}<Bar dataKey="coverage" name="Coverage %" fill="url(#c1Blue)" radius={[6, 6, 0, 0]} /><Bar dataKey="completed" name="Tasks done" fill="url(#c1Teal)" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer></div>
           <div className="card" style={{ height: 300 }}><h3>Conflicts & safety</h3><ResponsiveContainer width="100%" height="88%"><BarChart data={comparison}>{grads('c2')}<CartesianGrid stroke={P.grid} strokeDasharray="3 3" /><XAxis dataKey="mode" stroke={P.axis} /><YAxis stroke={P.axis} allowDecimals={false} /><Tooltip {...TT} />{legend}<Bar dataKey="duplicates" name="Duplicate assignments" fill="url(#c2Indigo)" radius={[6, 6, 0, 0]} /><Bar dataKey="safety" name="Safety violations" fill="url(#c2Green)" radius={[6, 6, 0, 0]} /><Bar dataKey="blocked" name="Blocked tasks" fill="url(#c2Red)" radius={[6, 6, 0, 0]} /></BarChart></ResponsiveContainer></div></div></>}

@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
-import { NavLink, Route, Routes } from 'react-router-dom'
+import { NavLink, Navigate, Route, Routes } from 'react-router-dom'
 import { useStore } from './store'
-import { AUTH_ON } from './api'
 import { useAuth } from './auth'
 import RequireAuth from './components/RequireAuth'
-import ThemeToggle from './components/ThemeToggle'
 import ProfileMenu from './components/ProfileMenu'
+import ThemeToggle from './components/ThemeToggle'
+import Login from './pages/Login'
 import Home from './pages/Home'
 import Scenarios from './pages/Scenarios'
 import Mission from './pages/Mission'
@@ -14,14 +14,25 @@ import Analytics from './pages/Analytics'
 import Settings from './pages/Settings'
 
 const tabs = [['/', 'HOME'], ['/mission', 'MISSION CONTROL'], ['/scenarios', 'SCENARIOS'], ['/experiments', 'EXPERIMENTS'], ['/analytics', 'ANALYTICS'], ['/settings', 'SETTINGS']]
+
 export default function App() {
-  const boot = useStore((s) => s.boot); const run = useStore((s) => s.run); const warming = useStore((s) => s.warming)
-  const { status, init } = useAuth()
+  const boot = useStore((state) => state.boot)
+  const health = useStore((state) => state.health)
+  const booting = useStore((state) => state.booting)
+  const run = useStore((state) => state.run)
+  const initAuth = useAuth((state) => state.init)
+  const authEnabled = useAuth((state) => state.enabled)
+  const authStatus = useAuth((state) => state.status)
   const [now, setNow] = useState(new Date())
-  useEffect(() => { init() }, [])
-  useEffect(() => { if (status === 'in') boot() }, [status]) // load data only once signed in
-  useEffect(() => { const t = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(t) }, [])
-  const signedIn = !AUTH_ON || status === 'in'
+
+  useEffect(() => { void initAuth() }, [initAuth])
+  useEffect(() => { if (authStatus === 'in') void boot() }, [authStatus, boot])
+  useEffect(() => { const timer = setInterval(() => setNow(new Date()), 1000); return () => clearInterval(timer) }, [])
+
+  const appVisible = authEnabled === false || authStatus === 'in'
+  const apiOnline = health === 'ok' || health === 'db-offline'
+  // UI change: "DATABASE OFFLINE" text removed from the header label
+  const apiLabel = health === 'ok' || health === 'db-offline' ? 'API ONLINE' : health.toUpperCase()
   return (
     <div className="app">
       <header className="top">
@@ -29,26 +40,27 @@ export default function App() {
           <img src="/favicon.png" alt="RESQNET logo" className="brand-logo" />
           <span className="brand-name">RESQ<b>NET</b></span>
           <small>MISSION CONTROL</small>
-        </div>
-        <div className="sep" />
-        {signedIn && <nav>{tabs.map(([to, l]) => <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => (isActive ? 'on' : '')}>{l}</NavLink>)}</nav>}
-        {!signedIn && <div style={{ flex: 1 }} />}
+        </div><div className="sep" />
+        {appVisible && <nav>{tabs.map(([path, label]) => <NavLink key={path} to={path} end={path === '/'} className={({ isActive }) => (isActive ? 'on' : '')}>{label}</NavLink>)}</nav>}
         <div className="top-r">
-          {signedIn && <><span className="mono mut">{run ? `TICK ${run.tick}` : 'NO RUN'}</span>
-          <span className="clock mono">{now.toLocaleTimeString('en-GB')}</span></>}
+          {appVisible && <><span className="mono mut">{run ? `TICK ${run.tick}` : 'NO RUN'}</span><span className="clock mono">{now.toLocaleTimeString('en-GB')}</span></>}
+          {appVisible && <span className="api-indicator" title="Backend API status"><span className={'dot ' + (apiOnline ? 'g' : 'r')} /><span className="mono">{apiLabel}</span></span>}
           <ThemeToggle />
           <ProfileMenu />
         </div>
       </header>
-      {signedIn && warming && <div className="note" role="status">Syncing live data from the server. The first load can take up to a minute.</div>}
+      {appVisible && booting && <div className="note" role="status">Loading scenarios, fleet settings, and failure schedules…</div>}
       <main>
-        <RequireAuth>
-          <Routes>
-            <Route path="/" element={<Home />} /><Route path="/scenarios" element={<Scenarios />} />
-            <Route path="/mission" element={<Mission />} /><Route path="/experiments" element={<Experiments />} />
-            <Route path="/analytics" element={<Analytics />} /><Route path="/settings" element={<Settings />} />
-          </Routes>
-        </RequireAuth>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/" element={<RequireAuth><Home /></RequireAuth>} />
+          <Route path="/scenarios" element={<RequireAuth><Scenarios /></RequireAuth>} />
+          <Route path="/mission" element={<RequireAuth><Mission /></RequireAuth>} />
+          <Route path="/experiments" element={<RequireAuth><Experiments /></RequireAuth>} />
+          <Route path="/analytics" element={<RequireAuth><Analytics /></RequireAuth>} />
+          <Route path="/settings" element={<RequireAuth><Settings /></RequireAuth>} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </main>
     </div>
   )

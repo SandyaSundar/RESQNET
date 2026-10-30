@@ -1,9 +1,25 @@
-# RESQNET Frontend (React + Vite + TS) — black + dark-navy mission control
-1. `cp .env.example .env`, set `VITE_API_KEY` (and `VITE_API_KEY_HEADER` if needed).
-2. Start the backend (`uvicorn app.main:app --reload` on :8000).
-3. `npm install && npm run dev` -> http://localhost:5173 (dev proxy forwards /api).
+# RESQNET Frontend
 
-Windows: Home · Mission Control (Image-1 layout, 3D satellite map) · Scenarios · Experiments · Analytics · Settings.
+React and Vite client for the RESQNET simulation API.
 
-Backend-derived: scenarios, grid, drones, tasks, coverage, candidates. Derived client-side from real states: events, alerts, handoffs, ownership conflicts, duplicate count, safety violations (drone in restricted/blocked cell), recovery time.
-Not provided by backend yet (shown honestly): battery (estimated from distance flown, marked `*`), POST /failures (real reply/error is displayed), communication_overhead. Optional fields are used automatically if added: drone.battery, drone.connected, run.metrics.*.
+## Local development
+
+Copy `.env.example` to `.env` and leave `VITE_BACKEND_URL` blank. The browser uses same-origin `/api` requests and Vite proxies them to `http://127.0.0.1:8000` during development.
+
+```powershell
+npm ci
+npm run dev
+```
+
+## Deployment
+
+Keep the existing Vercel project rooted at `frontend`. Set its production environment variable `VITE_BACKEND_URL` to the Railway backend's public origin, with no trailing slash. The backend must allow `https://resqnet-eight-psi.vercel.app` in `CORS_ORIGINS`.
+
+Google sign-in is configured by `GOOGLE_CLIENT_ID` on the backend. Add the
+frontend origin to the Google web client's **Authorized JavaScript origins**
+and to backend `CORS_ORIGINS`. The backend returns the public client ID via
+`GET /api/auth/config`; the frontend does not need a separate client-ID value.
+See the backend README's **Google sign-in** section for local and production
+cookie settings and the implemented auth API contract.
+
+The Mission and Experiments pages install the selected dataset failure schedule before simulation ticks begin. Event lifecycle is returned by the backend; consult the Mission page's notes for which failure effects are operationally modeled.
